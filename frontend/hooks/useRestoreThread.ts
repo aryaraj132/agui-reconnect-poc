@@ -18,6 +18,7 @@ interface RestoreResult {
   threadData: ThreadData | null;
   isRestoring: boolean;
   isStreamActive: boolean;
+  isCatchingUp: boolean;
   currentActivity: ActivityContent | null;
   currentReasoning: string;
   restoredSegment: Segment | null;
@@ -80,6 +81,7 @@ export function useRestoreThread(
     useState<ActivityContent | null>(null);
   const [currentReasoning, setCurrentReasoning] = useState("");
   const [restoredSegment, setRestoredSegment] = useState<Segment | null>(null);
+  const [isCatchingUp, setIsCatchingUp] = useState(false);
 
   // Fallback: fetch thread data via REST (used when SSE fails)
   const restoreFallback = useCallback(
@@ -127,6 +129,7 @@ export function useRestoreThread(
     setCurrentReasoning("");
     setRestoredSegment(null);
     setIsStreamActive(false);
+    setIsCatchingUp(false);
 
     if (!isExistingThread) {
       setIsRestoring(false);
@@ -154,10 +157,18 @@ export function useRestoreThread(
         const reader = res.body.getReader();
         let reasoningBuffer = "";
 
+        let catchingUp = true;
+        setIsCatchingUp(true);
+
         for await (const event of parseSSEStream(reader)) {
           if (signal.aborted) break;
 
           const eventType = event.type as string;
+
+          // Fast-forward delay during catch-up (XRANGE events arrive in burst)
+          if (catchingUp && eventType !== "RUN_STARTED" && eventType !== "MESSAGES_SNAPSHOT" && eventType !== "STATE_SNAPSHOT" && eventType !== "RUN_FINISHED" && eventType !== "RUN_ERROR") {
+            await new Promise((r) => setTimeout(r, 100));
+          }
 
           switch (eventType) {
             case "MESSAGES_SNAPSHOT": {
@@ -228,10 +239,26 @@ export function useRestoreThread(
               break;
             }
 
+            case "TOOL_CALL_START":
+            case "TOOL_CALL_ARGS":
+            case "TOOL_CALL_END": {
+              // Tool call events replay update_progress_status during catch-up
+              break;
+            }
+
+            case "STEP_STARTED":
+            case "STEP_FINISHED": {
+              // Step events replayed during catch-up for progression
+              break;
+            }
+
             case "RUN_FINISHED":
             case "RUN_ERROR": {
+              if (catchingUp) {
+                catchingUp = false;
+                setIsCatchingUp(false);
+              }
               setIsStreamActive(false);
-              // Clear transient UI after a brief delay
               setTimeout(() => {
                 setCurrentActivity(null);
                 setCurrentReasoning("");
@@ -249,6 +276,7 @@ export function useRestoreThread(
         if (!signal.aborted) {
           setIsRestoring(false);
           setIsStreamActive(false);
+          setIsCatchingUp(false);
         }
       }
     }
@@ -264,6 +292,7 @@ export function useRestoreThread(
     threadData,
     isRestoring,
     isStreamActive,
+    isCatchingUp,
     currentActivity,
     currentReasoning,
     restoredSegment,

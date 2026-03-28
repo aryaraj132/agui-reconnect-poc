@@ -29,14 +29,21 @@ async def lifespan(app: FastAPI):
     # Initialize Redis connection
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
     logger.info("Connecting to Redis at %s", redis_url)
-    app.state.redis_manager = RedisStreamManager(redis_url)
-    logger.info("Redis connected")
+    try:
+        app.state.redis_manager = RedisStreamManager(redis_url)
+        logger.info("Redis manager initialized")
+    except Exception:
+        logger.warning("Redis initialization failed, running without persistence")
+        app.state.redis_manager = RedisStreamManager(redis_url)
 
     yield
 
     # Cleanup
-    await app.state.redis_manager.close()
-    logger.info("Redis connection closed")
+    try:
+        await app.state.redis_manager.close()
+        logger.info("Redis connection closed")
+    except Exception:
+        logger.warning("Redis cleanup failed")
 
 
 app = FastAPI(

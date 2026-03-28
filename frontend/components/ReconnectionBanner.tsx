@@ -9,6 +9,7 @@ interface ActivityContent {
 interface ReconnectionBannerProps {
   isRestoring: boolean;
   isStreamActive: boolean;
+  isCatchingUp: boolean;
   currentActivity: ActivityContent | null;
   currentReasoning: string;
 }
@@ -16,6 +17,7 @@ interface ReconnectionBannerProps {
 export function ReconnectionBanner({
   isRestoring,
   isStreamActive,
+  isCatchingUp,
   currentActivity,
   currentReasoning,
 }: ReconnectionBannerProps) {
@@ -36,7 +38,9 @@ export function ReconnectionBanner({
             <div className="flex items-center justify-between gap-2">
               <span className="text-sm font-medium truncate">
                 {isStreamActive
-                  ? currentActivity?.title || "Reconnecting to stream..."
+                  ? isCatchingUp
+                    ? "Catching up..."
+                    : currentActivity?.title || "Following live stream..."
                   : "Restoring session..."}
               </span>
               {currentActivity && (

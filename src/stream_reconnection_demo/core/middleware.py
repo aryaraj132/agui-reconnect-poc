@@ -128,13 +128,22 @@ class RedisStreamMiddleware:
     async def apply(self, event_stream: AsyncIterator[str]) -> AsyncIterator[str]:
         try:
             async for event in event_stream:
-                await self._redis.write_event(
-                    self._thread_id, self._run_id, event
-                )
+                try:
+                    await self._redis.write_event(
+                        self._thread_id, self._run_id, event
+                    )
+                except Exception:
+                    logger.warning("Redis write_event failed, skipping persistence")
                 yield event
-            await self._redis.mark_complete(self._thread_id, self._run_id)
+            try:
+                await self._redis.mark_complete(self._thread_id, self._run_id)
+            except Exception:
+                logger.warning("Redis mark_complete failed")
         except Exception:
-            await self._redis.mark_error(
-                self._thread_id, self._run_id, "Stream error"
-            )
+            try:
+                await self._redis.mark_error(
+                    self._thread_id, self._run_id, "Stream error"
+                )
+            except Exception:
+                logger.warning("Redis mark_error failed")
             raise

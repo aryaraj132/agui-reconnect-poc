@@ -101,9 +101,101 @@ class RedisStreamManager:
         await self._redis.expire(key, STREAM_TTL)
         logger.info("Error in run %s for thread %s: %s", run_id, thread_id, error)
 
+    async def read_existing(
+        self, thread_id: str, run_id: str
+    ) -> list[tuple[str, dict[str, str]]]:
+        """XRANGE — return all existing entries (non-blocking).
+
+        Returns list of (message_id, fields_dict) tuples.
+        """
+        key = self._stream_key(thread_id, run_id)
+        entries = await self._redis.xrange(key)
+        return entries  # list of (msg_id, {type, data, ts})
+
+    async def follow_live(
+        self,
+        thread_id: str,
+        run_id: str,
+        last_id: str = "0",
+    ) -> AsyncIterator[dict[str, Any]]:
+        """XREAD BLOCK — yield new entries until STREAM_END.
+
+        Starts reading from after ``last_id``. Blocks up to 2 seconds
+        per read cycle. Stops when STREAM_END or STREAM_ERROR sentinel
+        is encountered, or when the run is no longer active.
+        """
+        key = self._stream_key(thread_id, run_id)
+
+        while True:
+            entries = await self._redis.xread(
+                {key: last_id}, block=2000, count=50
+            )
+
+            if entries:
+                for _stream_name, messages in entries:
+                    for msg_id, fields in messages:
+                        last_id = msg_id
+                        event_type = fields.get("type", "")
+
+                        if event_type in (STREAM_END, STREAM_ERROR):
+                            return
+
+                        yield {
+                            "id": msg_id,
+                            "type": event_type,
+                            "data": fields.get("data", ""),
+                            "ts": fields.get("ts", ""),
+                        }
+            else:
+                # No new entries within timeout — check if run is still active
+                active = await self.get_active_run(thread_id)
+                if active != run_id:
+                    # Do one final non-blocking read
+                    remaining = await self._redis.xread(
+                        {key: last_id}, count=100
+                    )
+                    if remaining:
+                        for _stream_name, messages in remaining:
+                            for msg_id, fields in messages:
+                                event_type = fields.get("type", "")
+                                if event_type in (STREAM_END, STREAM_ERROR):
+                                    return
+                                yield {
+                                    "id": msg_id,
+                                    "type": event_type,
+                                    "data": fields.get("data", ""),
+                                    "ts": fields.get("ts", ""),
+                                }
+                    return
+
+    async def stream_exists(self, thread_id: str, run_id: str) -> bool:
+        """Check if a Redis stream exists for the given thread and run."""
+        key = self._stream_key(thread_id, run_id)
+        return await self._redis.exists(key) > 0
+
     async def get_active_run(self, thread_id: str) -> str | None:
         """Return the active run_id for a thread, or None."""
         return await self._redis.get(self._active_key(thread_id))
+
+    async def find_stream(self, thread_id: str) -> str | None:
+        """Find any stream (active or completed) for a thread.
+
+        Checks active_run key first, then scans for stream:thread_id:* keys.
+        Returns the run_id if found, None otherwise.
+        """
+        # Check active run first
+        active = await self.get_active_run(thread_id)
+        if active:
+            return active
+
+        # Scan for completed streams (key pattern: stream:{thread_id}:*)
+        pattern = f"stream:{thread_id}:*"
+        async for key in self._redis.scan_iter(match=pattern, count=10):
+            # Extract run_id from key: "stream:{thread_id}:{run_id}"
+            parts = key.split(":", 2)
+            if len(parts) == 3:
+                return parts[2]
+        return None
 
     async def read_events(
         self,

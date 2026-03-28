@@ -1,10 +1,11 @@
 "use client";
 
-import { Suspense, useEffect, useRef } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import {
   CopilotKit,
   useCoAgentStateRender,
   useCoAgent,
+  useCopilotAction,
 } from "@copilotkit/react-core";
 import {
   CopilotSidebar,
@@ -21,6 +22,7 @@ import { ReconnectionBanner } from "@/components/ReconnectionBanner";
 import { AgentHistoryPanel } from "@/components/AgentHistoryPanel";
 import { useAgentThread } from "@/hooks/useAgentThread";
 import { useRestoreThread } from "@/hooks/useRestoreThread";
+import { ProgressStatus } from "@/components/ProgressStatus";
 import type { Segment } from "@/lib/types";
 
 function CustomRenderMessage({
@@ -41,6 +43,13 @@ function CustomRenderMessage({
       .slice(index + 1)
       .some((m) => m.role === "assistant" && m.content);
     if (fromOldTurn) return null;
+
+    // Only render the LAST message of this role type — skip older ones
+    // so activity replaces (not stacks) and reasoning shows only the latest
+    const hasNewerOfSameRole = messages
+      .slice(index + 1)
+      .some((m) => m.role === message.role);
+    if (hasNewerOfSameRole) return null;
 
     if (message.role === "reasoning") {
       return <ReasoningPanel reasoning={message.content} defaultOpen />;
@@ -104,10 +113,36 @@ function SegmentPageContent({
     threadData,
     isRestoring,
     isStreamActive,
+    isCatchingUp,
     currentActivity,
     currentReasoning,
     restoredSegment,
   } = useRestoreThread(threadId, isExistingThread);
+
+  const [progressStatus, setProgressStatus] = useState<{
+    status: string;
+    node: string;
+    nodeIndex: number;
+    totalNodes: number;
+  } | null>(null);
+
+  useCopilotAction({
+    name: "update_progress_status",
+    parameters: [
+      { name: "status", type: "string", description: "Current status" },
+      { name: "node", type: "string", description: "Current node name" },
+      { name: "node_index", type: "number", description: "Current node index" },
+      { name: "total_nodes", type: "number", description: "Total number of nodes" },
+    ],
+    handler: ({ status, node, node_index, total_nodes }) => {
+      setProgressStatus({
+        status,
+        node,
+        nodeIndex: node_index,
+        totalNodes: total_nodes,
+      });
+    },
+  });
 
   // Restore segment state from reconnection
   useEffect(() => {
@@ -132,30 +167,39 @@ function SegmentPageContent({
       <ReconnectionBanner
         isRestoring={isRestoring}
         isStreamActive={isStreamActive}
+        isCatchingUp={isCatchingUp}
         currentActivity={currentActivity}
         currentReasoning={currentReasoning}
       />
       <Nav />
       <main className="flex-1 flex items-center justify-center p-8">
-        {segment?.condition_groups ? (
-          <div className="w-full max-w-lg">
-            <SegmentCard segment={segment} />
-          </div>
-        ) : isStreamActive && currentActivity ? (
-          <div className="w-full max-w-md space-y-4">
-            <ActivityIndicator
-              activityType="processing"
-              content={currentActivity}
+        <div className="w-full max-w-lg space-y-6">
+          {progressStatus && (
+            <ProgressStatus
+              status={progressStatus.status}
+              node={progressStatus.node}
+              nodeIndex={progressStatus.nodeIndex}
+              totalNodes={progressStatus.totalNodes}
             />
-            {currentReasoning && (
-              <ReasoningPanel reasoning={currentReasoning} defaultOpen />
-            )}
-          </div>
-        ) : (
-          <p className="text-sm text-gray-400">
-            Describe your audience in the sidebar to generate a segment.
-          </p>
-        )}
+          )}
+          {segment?.condition_groups ? (
+            <SegmentCard segment={segment} />
+          ) : isStreamActive && currentActivity ? (
+            <div className="space-y-4">
+              <ActivityIndicator
+                activityType="processing"
+                content={currentActivity}
+              />
+              {currentReasoning && (
+                <ReasoningPanel reasoning={currentReasoning} defaultOpen />
+              )}
+            </div>
+          ) : !progressStatus ? (
+            <p className="text-sm text-gray-400 text-center">
+              Describe your audience in the sidebar to generate a segment.
+            </p>
+          ) : null}
+        </div>
       </main>
     </div>
   );

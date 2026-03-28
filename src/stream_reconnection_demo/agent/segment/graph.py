@@ -75,7 +75,7 @@ KEYWORD_FIELD_MAP = {
 
 async def analyze_requirements(state: SegmentAgentState) -> dict:
     """Node 1: Analyze the user's query and extract key requirements."""
-    await asyncio.sleep(2)
+    await asyncio.sleep(8)
 
     query = ""
     for msg in reversed(state["messages"]):
@@ -106,9 +106,42 @@ async def analyze_requirements(state: SegmentAgentState) -> dict:
     }
 
 
+async def extract_entities(state: SegmentAgentState) -> dict:
+    """Node 2: Identify entity types from the requirements."""
+    await asyncio.sleep(8)
+
+    requirements = state.get("requirements", "")
+    entities = []
+
+    entity_categories = {
+        "location": ["country", "city"],
+        "temporal": ["signup_date", "last_purchase_date", "last_login_date"],
+        "behavioral": ["purchase_count", "total_spent", "login_count", "page_views"],
+        "demographic": ["age", "gender", "language"],
+        "engagement": ["email_opened", "email_clicked", "app_opens", "feature_used"],
+        "account": ["plan_type", "account_status"],
+    }
+
+    for category, fields in entity_categories.items():
+        for field in fields:
+            if field in requirements.lower():
+                entities.append({"category": category, "field": field})
+
+    if not entities:
+        entities = [
+            {"category": "location", "field": "country"},
+            {"category": "behavioral", "field": "purchase_count"},
+        ]
+
+    return {
+        "current_node": "extract_entities",
+        "entities": entities,
+    }
+
+
 async def validate_fields(state: SegmentAgentState) -> dict:
-    """Node 2: Validate detected fields against the available catalog."""
-    await asyncio.sleep(2)
+    """Node 3: Validate detected fields against the available catalog."""
+    await asyncio.sleep(8)
 
     requirements = state.get("requirements", "")
     # Extract field names from the requirements
@@ -128,42 +161,107 @@ async def validate_fields(state: SegmentAgentState) -> dict:
     }
 
 
-async def generate_conditions(state: SegmentAgentState) -> dict:
-    """Node 3: Generate draft condition structures from validated fields."""
-    await asyncio.sleep(2.5)
+async def map_operators(state: SegmentAgentState) -> dict:
+    """Node 4: Select appropriate operators for each validated field."""
+    await asyncio.sleep(8)
 
     validated_fields = state.get("validated_fields", [])
-    conditions_draft = []
+    operator_mappings = []
+
     for field in validated_fields:
         if field in ("country", "city", "language", "gender", "plan_type", "account_status"):
-            conditions_draft.append({
-                "field": field,
-                "operator": "equals",
-                "value_hint": "exact match",
+            operator_mappings.append({
+                "field": field, "operator": "equals", "type": "categorical",
             })
         elif field in ("signup_date", "last_purchase_date", "last_login_date"):
-            conditions_draft.append({
-                "field": field,
-                "operator": "within_last",
-                "value_hint": "temporal range",
+            operator_mappings.append({
+                "field": field, "operator": "within_last", "type": "temporal",
             })
         elif field in ("purchase_count", "total_spent", "login_count",
                         "page_views", "session_duration", "age"):
-            conditions_draft.append({
-                "field": field,
-                "operator": "greater_than",
-                "value_hint": "numeric threshold",
+            operator_mappings.append({
+                "field": field, "operator": "greater_than", "type": "numeric",
             })
         else:
-            conditions_draft.append({
-                "field": field,
-                "operator": "is_set",
-                "value_hint": "existence check",
+            operator_mappings.append({
+                "field": field, "operator": "is_set", "type": "existence",
             })
+
+    return {
+        "current_node": "map_operators",
+        "operator_mappings": operator_mappings,
+    }
+
+
+async def generate_conditions(state: SegmentAgentState) -> dict:
+    """Node 5: Generate draft condition structures from validated fields."""
+    await asyncio.sleep(10)
+
+    operator_mappings = state.get("operator_mappings", [])
+    validated_fields = state.get("validated_fields", [])
+    conditions_draft = []
+
+    if operator_mappings:
+        for mapping in operator_mappings:
+            conditions_draft.append({
+                "field": mapping["field"],
+                "operator": mapping["operator"],
+                "value_hint": f"{mapping['type']} match",
+            })
+    else:
+        for field in validated_fields:
+            if field in ("country", "city", "language", "gender", "plan_type", "account_status"):
+                conditions_draft.append({"field": field, "operator": "equals", "value_hint": "exact match"})
+            elif field in ("signup_date", "last_purchase_date", "last_login_date"):
+                conditions_draft.append({"field": field, "operator": "within_last", "value_hint": "temporal range"})
+            elif field in ("purchase_count", "total_spent", "login_count", "page_views", "session_duration", "age"):
+                conditions_draft.append({"field": field, "operator": "greater_than", "value_hint": "numeric threshold"})
+            else:
+                conditions_draft.append({"field": field, "operator": "is_set", "value_hint": "existence check"})
 
     return {
         "current_node": "generate_conditions",
         "conditions_draft": conditions_draft,
+    }
+
+
+async def optimize_conditions(state: SegmentAgentState) -> dict:
+    """Node 6: Simplify and deduplicate conditions."""
+    await asyncio.sleep(10)
+
+    conditions_draft = state.get("conditions_draft", [])
+    seen_fields = set()
+    optimized = []
+
+    for cond in conditions_draft:
+        field = cond.get("field", "")
+        if field not in seen_fields:
+            seen_fields.add(field)
+            optimized.append({**cond, "optimized": True})
+
+    return {
+        "current_node": "optimize_conditions",
+        "optimized_conditions": optimized,
+    }
+
+
+async def estimate_scope(state: SegmentAgentState) -> dict:
+    """Node 7: Estimate audience size and reach."""
+    await asyncio.sleep(8)
+
+    optimized_conditions = state.get("optimized_conditions", [])
+    num_conditions = len(optimized_conditions)
+
+    if num_conditions <= 1:
+        estimate = "Broad audience — minimal filtering applied"
+    elif num_conditions <= 3:
+        estimate = "Moderate audience — balanced between reach and specificity"
+    else:
+        estimate = "Narrow audience — highly targeted with multiple filters"
+
+    return {
+        "current_node": "estimate_scope",
+        "scope_estimate": f"{estimate} ({num_conditions} conditions active)",
     }
 
 
@@ -182,15 +280,23 @@ def _build_segment_node(llm: ChatAnthropic):
                 break
 
         requirements = state.get("requirements", "")
+        entities = state.get("entities", [])
         validated_fields = state.get("validated_fields", [])
+        operator_mappings = state.get("operator_mappings", [])
         conditions_draft = state.get("conditions_draft", [])
+        optimized_conditions = state.get("optimized_conditions", [])
+        scope_estimate = state.get("scope_estimate", "")
 
         enriched_prompt = (
             f"{SYSTEM_PROMPT}\n\n"
             f"## Pre-analyzed Context\n"
             f"Requirements: {requirements}\n"
+            f"Entities: {entities}\n"
             f"Validated fields: {', '.join(validated_fields)}\n"
-            f"Draft conditions: {conditions_draft}\n\n"
+            f"Operator mappings: {operator_mappings}\n"
+            f"Draft conditions: {conditions_draft}\n"
+            f"Optimized conditions: {optimized_conditions}\n"
+            f"Scope estimate: {scope_estimate}\n\n"
             f"Use these pre-analyzed results to generate the final segment."
         )
 
@@ -216,22 +322,27 @@ def _build_segment_node(llm: ChatAnthropic):
 
 
 def build_segment_graph(model: str = "claude-sonnet-4-20250514"):
-    """Build and compile the multi-node segment generation graph.
-
-    Pipeline: analyze_requirements -> validate_fields -> generate_conditions -> build_segment
-    """
+    """Build and compile the 8-node segment generation graph."""
     llm = ChatAnthropic(model=model)
 
     graph = StateGraph(SegmentAgentState)
     graph.add_node("analyze_requirements", analyze_requirements)
+    graph.add_node("extract_entities", extract_entities)
     graph.add_node("validate_fields", validate_fields)
+    graph.add_node("map_operators", map_operators)
     graph.add_node("generate_conditions", generate_conditions)
+    graph.add_node("optimize_conditions", optimize_conditions)
+    graph.add_node("estimate_scope", estimate_scope)
     graph.add_node("build_segment", _build_segment_node(llm))
 
     graph.add_edge(START, "analyze_requirements")
-    graph.add_edge("analyze_requirements", "validate_fields")
-    graph.add_edge("validate_fields", "generate_conditions")
-    graph.add_edge("generate_conditions", "build_segment")
+    graph.add_edge("analyze_requirements", "extract_entities")
+    graph.add_edge("extract_entities", "validate_fields")
+    graph.add_edge("validate_fields", "map_operators")
+    graph.add_edge("map_operators", "generate_conditions")
+    graph.add_edge("generate_conditions", "optimize_conditions")
+    graph.add_edge("optimize_conditions", "estimate_scope")
+    graph.add_edge("estimate_scope", "build_segment")
     graph.add_edge("build_segment", END)
 
     return graph.compile()

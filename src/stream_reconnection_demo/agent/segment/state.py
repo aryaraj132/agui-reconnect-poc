@@ -9,6 +9,10 @@ class SegmentAgentState(TypedDict):
     error: str | None
     # Multi-node pipeline tracking
     current_node: str
-    requirements: str | None
-    validated_fields: list
-    conditions_draft: list
+    requirements: str | None        # from analyze_requirements
+    entities: list                   # from extract_entities
+    validated_fields: list           # from validate_fields
+    operator_mappings: list          # from map_operators
+    conditions_draft: list           # from generate_conditions
+    optimized_conditions: list       # from optimize_conditions
+    scope_estimate: str | None       # from estimate_scope
