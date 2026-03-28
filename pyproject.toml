@@ -1,0 +1,29 @@
+[project]
+name = "stream-reconnection-demo"
+version = "0.1.0"
+description = "AG-UI stream reconnection POC using Redis Streams"
+requires-python = ">=3.13"
+dependencies = [
+    "ag-ui-protocol>=0.1.14",
+    "langgraph>=0.4.1",
+    "langchain-anthropic>=0.4.4",
+    "langchain-core>=0.3.59",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "pydantic>=2.11.0",
+    "redis[hiredis]>=5.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stream_reconnection_demo"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+    "pytest-asyncio>=1.0.0",
+    "ruff>=0.9.0",
+]
