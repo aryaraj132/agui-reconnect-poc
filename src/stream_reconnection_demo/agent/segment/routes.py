@@ -128,19 +128,6 @@ async def generate_segment(request: Request):
     run_id = get_field(body, "run_id", "runId", str(uuid.uuid4()))
     query = extract_user_query(body.get("messages", []))
 
-    # DEBUG: dump full body to trace what CopilotKit/LangGraphHttpAgent sends
-    import json as _json
-    logging.info(
-        "POST /segment — thread_id=%s, run_id=%s, query=%r\n  BODY: %s",
-        thread_id, run_id, query[:80] if query else "",
-        _json.dumps({k: v for k, v in body.items() if k != "messages"}, default=str),
-    )
-    logging.info(
-        "POST /segment — messages count=%d, message_roles=%s",
-        len(body.get("messages", [])),
-        [m.get("role", "?") for m in body.get("messages", [])],
-    )
-
     segment_graph = request.app.state.segment_graph
     redis_manager = request.app.state.redis_manager
 

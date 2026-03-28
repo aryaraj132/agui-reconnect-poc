@@ -7,6 +7,11 @@ prepare:
     uv sync
     cd frontend && npm install
 
+# Install all dependencies (backend + frontend-next)
+prepare-next:
+    uv sync
+    cd frontend-next && npm install
+
 # Install backend dependencies only
 install:
     uv sync
@@ -19,9 +24,13 @@ redis:
 backend:
     uv run python -m stream_reconnection_demo.main
 
-# Run the Next.js frontend dev server
+# Run the React + webpack frontend dev server
 frontend:
     cd frontend && npm run dev
+
+# Run the Next.js + CopilotKit frontend (reference version)
+frontend-next:
+    cd frontend-next && npm run dev
 
 # Run backend (alias)
 run: backend
