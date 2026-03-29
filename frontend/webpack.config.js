@@ -37,6 +37,9 @@ module.exports = {
       "process.env.BACKEND_URL": JSON.stringify(
         process.env.BACKEND_URL || "http://localhost:8000"
       ),
+      "process.env.COPILOT_RUNTIME_URL": JSON.stringify(
+        process.env.COPILOT_RUNTIME_URL || "/copilotkit"
+      ),
     }),
   ],
   devServer: {
@@ -44,5 +47,55 @@ module.exports = {
     hot: true,
     historyApiFallback: true,
     open: false,
+    setupMiddlewares: (middlewares, devServer) => {
+      // Embed CopilotRuntime in the dev server — no separate process needed.
+      // Dynamic import because @copilotkit/runtime is ESM.
+      (async () => {
+        try {
+          const { CopilotRuntime, copilotRuntimeNodeHttpEndpoint, EmptyAdapter } =
+            await import("@copilotkit/runtime");
+          const { LangGraphHttpAgent } = await import(
+            "@copilotkit/runtime/langgraph"
+          );
+
+          const backendUrl = process.env.BACKEND_URL || "http://localhost:8000";
+
+          const runtime = new CopilotRuntime({
+            agents: {
+              default: new LangGraphHttpAgent({
+                url: `${backendUrl}/api/v1/segment`,
+                description: "Segment generation agent",
+              }),
+            },
+          });
+
+          const handler = copilotRuntimeNodeHttpEndpoint({
+            runtime,
+            serviceAdapter: new EmptyAdapter(),
+            endpoint: "/copilotkit",
+          });
+
+          // Register the route on the Express app
+          devServer.app.all("/copilotkit", async (req, res) => {
+            try {
+              await handler(req, res);
+            } catch (err) {
+              console.error("CopilotRuntime error:", err);
+              if (!res.headersSent) {
+                res.status(500).send("Internal server error");
+              }
+            }
+          });
+
+          console.log(
+            `CopilotRuntime embedded at /copilotkit → ${backendUrl}/api/v1/segment`
+          );
+        } catch (err) {
+          console.error("Failed to set up CopilotRuntime:", err);
+        }
+      })();
+
+      return middlewares;
+    },
   },
 };

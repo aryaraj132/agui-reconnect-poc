@@ -8,12 +8,15 @@ Phase 2: Catch-up — XRANGE (filtered if ThreadStore sent state, unfiltered oth
 Phase 3: Live follow — XREAD BLOCK, unfiltered
 """
 
+import asyncio
 import logging
+import time
 import uuid
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
+from stream_reconnection_demo.agent.segment.routes import run_segment_pipeline
 from stream_reconnection_demo.core.events import EventEmitter
 from stream_reconnection_demo.core.history import thread_store
 from stream_reconnection_demo.core.middleware import _parse_sse_event
@@ -21,6 +24,30 @@ from stream_reconnection_demo.core.middleware import _parse_sse_event
 router = APIRouter(prefix="/api/v1")
 emitter = EventEmitter()
 logger = logging.getLogger(__name__)
+
+# Stale run timeout in seconds
+STALE_TIMEOUT = 30
+
+# Fast-forward delays per event type (in seconds) during XRANGE catch-up
+FAST_FORWARD_DELAYS: dict[str, float] = {
+    "STEP_STARTED": 0.2,
+    "STEP_FINISHED": 0.2,
+    "ACTIVITY_SNAPSHOT": 0.15,
+    "REASONING_START": 0.05,
+    "REASONING_MESSAGE_START": 0.0,
+    "REASONING_MESSAGE_CONTENT": 0.05,
+    "REASONING_MESSAGE_END": 0.0,
+    "REASONING_END": 0.05,
+    "TOOL_CALL_START": 0.1,
+    "TOOL_CALL_ARGS": 0.1,
+    "TOOL_CALL_END": 0.1,
+    "STATE_DELTA": 0.0,
+    "STATE_SNAPSHOT": 0.0,
+    "MESSAGES_SNAPSHOT": 0.0,
+    "RUN_STARTED": 0.0,
+    "RUN_FINISHED": 0.0,
+    "CUSTOM": 0.0,
+}
 
 # Event types to SKIP during catch-up ONLY when ThreadStore already sent state
 # (these would duplicate what ThreadStore provided)
@@ -158,6 +185,81 @@ async def reconnect_stream(thread_id: str, request: Request):
             event_data = fields.get("data", "")
             if event_data:
                 yield event_data
+                # Fast-forward delay based on event type
+                delay = FAST_FORWARD_DELAYS.get(event_type, 0.0)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+        # --- Stale detection ---
+        if not stream_ended and is_active and entries:
+            try:
+                last_ts = await redis_manager.get_last_event_timestamp(
+                    thread_id, run_id
+                )
+                if last_ts is not None:
+                    age = time.time() - last_ts
+                    if age > STALE_TIMEOUT:
+                        logger.warning(
+                            "Reconnect: STALE run %s for %s (last event %.0fs ago)",
+                            run_id, thread_id, age,
+                        )
+                        is_active = False
+                        stream_ended = True
+
+                        yield emitter.emit_custom(
+                            "run_stale",
+                            {"reason": "no_heartbeat", "age_seconds": age},
+                        )
+
+                        await redis_manager.clear_active_run(thread_id)
+
+                        # Auto-resubmit: find last user query
+                        last_query = None
+                        thread = thread_store.get_thread(thread_id)
+                        if thread and thread["messages"]:
+                            for msg in reversed(thread["messages"]):
+                                if msg.get("role") == "user":
+                                    last_query = msg.get("content", "")
+                                    break
+
+                        if last_query:
+                            yield emitter.emit_custom(
+                                "run_restarted",
+                                {"reason": "auto_resubmit"},
+                            )
+
+                            new_run_id = str(uuid.uuid4())
+                            segment_graph = request.app.state.segment_graph
+
+                            try:
+                                await redis_manager.start_run(thread_id, new_run_id)
+                                await redis_manager.push_run_history(thread_id, new_run_id)
+                            except Exception:
+                                logger.warning("Redis start for resubmit failed")
+
+                            from stream_reconnection_demo.core.middleware import RedisStreamMiddleware
+
+                            raw_pipeline = run_segment_pipeline(
+                                segment_graph,
+                                last_query,
+                                thread_id,
+                                new_run_id,
+                            )
+
+                            persisted_pipeline = RedisStreamMiddleware(
+                                redis_manager, thread_id, new_run_id
+                            ).apply(raw_pipeline)
+
+                            async for event in persisted_pipeline:
+                                yield event
+                            return
+                        else:
+                            logger.warning(
+                                "Reconnect: stale run but no user query to resubmit for %s",
+                                thread_id,
+                            )
+            except Exception:
+                logger.warning("Stale detection failed for %s", thread_id)
 
         if stream_ended:
             logger.info(
@@ -166,6 +268,12 @@ async def reconnect_stream(thread_id: str, request: Request):
             )
             yield emitter.emit_run_finished(thread_id, synthetic_run_id)
             return
+
+        # Signal catch-up complete before entering live follow
+        yield emitter.emit_custom(
+            "catchup_complete",
+            {"replayed_count": len(entries)},
+        )
 
         # --- Phase 3: Live follow (XREAD BLOCK, unfiltered) ---
         logger.info(

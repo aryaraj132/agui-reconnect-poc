@@ -7,10 +7,14 @@
     "build": "webpack --mode production"
   },
   "dependencies": {
+    "@copilotkit/react-core": "^1.8.16",
+    "@copilotkit/react-ui": "^1.8.16",
+    "@copilotkit/runtime-client-gql": "^1.8.16",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@copilotkit/runtime": "^1.8.16",
     "@tailwindcss/postcss": "^4.1.7",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",

@@ -1,15 +1,20 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { useCopilotMessagesContext } from "@copilotkit/react-core";
+import { TextMessage, Role } from "@copilotkit/runtime-client-gql";
 import { parseSSEStream } from "@/lib/sse";
 import type { ThreadData, Segment } from "@/lib/types";
 
+export type ReconnectPhase =
+  | "idle"
+  | "connecting"
+  | "catching_up"
+  | "live"
+  | "stale_recovery"
+  | "done"
+  | "error";
+
 const BACKEND_URL =
   process.env.BACKEND_URL || "http://localhost:8000";
-
-export interface Message {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-}
 
 interface ActivityContent {
   title: string;
@@ -22,6 +27,7 @@ interface RestoreResult {
   isRestoring: boolean;
   isStreamActive: boolean;
   isCatchingUp: boolean;
+  reconnectPhase: ReconnectPhase;
   currentActivity: ActivityContent | null;
   currentReasoning: string;
   restoredSegment: Segment | null;
@@ -29,15 +35,11 @@ interface RestoreResult {
 
 export function useRestoreThread(
   threadId: string,
-  isExistingThread: boolean,
-  setMessages: (msgs: Message[]) => void,
-  setSegment: (seg: Segment | null) => void
+  isExistingThread = true
 ): RestoreResult {
+  const { setMessages } = useCopilotMessagesContext();
   const setMessagesRef = useRef(setMessages);
   setMessagesRef.current = setMessages;
-
-  const setSegmentRef = useRef(setSegment);
-  setSegmentRef.current = setSegment;
 
   const [threadData, setThreadData] = useState<ThreadData | null>(null);
   const [isRestoring, setIsRestoring] = useState(isExistingThread);
@@ -47,6 +49,7 @@ export function useRestoreThread(
   const [currentReasoning, setCurrentReasoning] = useState("");
   const [restoredSegment, setRestoredSegment] = useState<Segment | null>(null);
   const [isCatchingUp, setIsCatchingUp] = useState(false);
+  const [reconnectPhase, setReconnectPhase] = useState<ReconnectPhase>("idle");
 
   // Fallback: fetch thread data via REST (used when SSE fails)
   const restoreFallback = useCallback(
@@ -62,21 +65,22 @@ export function useRestoreThread(
 
         setThreadData(data);
 
-        // Restore messages
+        // Restore messages into CopilotKit
         if (data.messages?.length > 0) {
-          const msgs: Message[] = data.messages.map((m) => ({
-            id: crypto.randomUUID(),
-            role: m.role === "user" ? ("user" as const) : ("assistant" as const),
-            content: m.content || "",
-          }));
+          const msgs = data.messages.map(
+            (m) =>
+              new TextMessage({
+                id: crypto.randomUUID(),
+                content: m.content || "",
+                role: m.role === "user" ? Role.User : Role.Assistant,
+              })
+          );
           setMessagesRef.current(msgs);
         }
 
         // Restore segment state
         if (data.state && (data.state as Record<string, unknown>).name) {
-          const seg = data.state as unknown as Segment;
-          setRestoredSegment(seg);
-          setSegmentRef.current(seg);
+          setRestoredSegment(data.state as unknown as Segment);
         }
       } catch (e) {
         if (!abortSignal.aborted) {
@@ -94,6 +98,7 @@ export function useRestoreThread(
     setRestoredSegment(null);
     setIsStreamActive(false);
     setIsCatchingUp(false);
+    setReconnectPhase("idle");
 
     if (!isExistingThread) {
       setIsRestoring(false);
@@ -106,6 +111,7 @@ export function useRestoreThread(
     async function reconnect() {
       try {
         // Connect to SSE reconnection endpoint
+        setReconnectPhase("connecting");
         const res = await fetch(
           `${BACKEND_URL}/api/v1/reconnect/${threadId}`,
           { signal }
@@ -123,6 +129,7 @@ export function useRestoreThread(
 
         let catchingUp = true;
         setIsCatchingUp(true);
+        setReconnectPhase("catching_up");
 
         for await (const event of parseSSEStream(reader)) {
           if (signal.aborted) break;
@@ -148,11 +155,14 @@ export function useRestoreThread(
                 content: string;
               }>;
               if (messages?.length > 0) {
-                const msgs: Message[] = messages.map((m) => ({
-                  id: crypto.randomUUID(),
-                  role: m.role === "user" ? ("user" as const) : ("assistant" as const),
-                  content: m.content || "",
-                }));
+                const msgs = messages.map(
+                  (m) =>
+                    new TextMessage({
+                      id: crypto.randomUUID(),
+                      content: m.content || "",
+                      role: m.role === "user" ? Role.User : Role.Assistant,
+                    })
+                );
                 setMessagesRef.current(msgs);
               }
               break;
@@ -161,7 +171,6 @@ export function useRestoreThread(
             case "STATE_SNAPSHOT": {
               const snapshot = event.snapshot as Record<string, unknown>;
               if (snapshot) {
-                // Build threadData-like object for state restoration
                 setThreadData((prev) => ({
                   messages: prev?.messages || [],
                   events: [],
@@ -171,11 +180,8 @@ export function useRestoreThread(
                   updated_at: new Date().toISOString(),
                 }));
 
-                // If this looks like a segment (has name + condition_groups)
                 if (snapshot.name && snapshot.condition_groups) {
-                  const seg = snapshot as unknown as Segment;
-                  setRestoredSegment(seg);
-                  setSegmentRef.current(seg);
+                  setRestoredSegment(snapshot as unknown as Segment);
                 }
               }
               break;
@@ -205,29 +211,55 @@ export function useRestoreThread(
             }
 
             case "TEXT_MESSAGE_CONTENT": {
-              // Text messages will be restored via MESSAGES_SNAPSHOT or added to existing
               break;
             }
 
             case "TOOL_CALL_START":
             case "TOOL_CALL_ARGS":
             case "TOOL_CALL_END": {
-              // Tool call events replay update_progress_status during catch-up
               break;
             }
 
             case "STEP_STARTED":
             case "STEP_FINISHED": {
-              // Step events replayed during catch-up for progression
               break;
             }
 
-            case "RUN_FINISHED":
+            case "CUSTOM": {
+              const customName = event.name as string;
+              if (customName === "run_stale") {
+                setReconnectPhase("stale_recovery");
+                setCurrentActivity(null);
+                setCurrentReasoning("");
+              } else if (customName === "run_restarted") {
+                setReconnectPhase("catching_up");
+              } else if (customName === "catchup_complete") {
+                setReconnectPhase("live");
+                setIsCatchingUp(false);
+              }
+              break;
+            }
+
+            case "RUN_FINISHED": {
+              if (catchingUp) {
+                catchingUp = false;
+                setIsCatchingUp(false);
+              }
+              setReconnectPhase("done");
+              setIsStreamActive(false);
+              setTimeout(() => {
+                setCurrentActivity(null);
+                setCurrentReasoning("");
+              }, 1000);
+              break;
+            }
+
             case "RUN_ERROR": {
               if (catchingUp) {
                 catchingUp = false;
                 setIsCatchingUp(false);
               }
+              setReconnectPhase("error");
               setIsStreamActive(false);
               setTimeout(() => {
                 setCurrentActivity(null);
@@ -240,6 +272,7 @@ export function useRestoreThread(
       } catch (e) {
         if (!signal.aborted) {
           console.error("SSE reconnection failed, falling back to REST:", e);
+          setReconnectPhase("error");
           await restoreFallback(signal);
         }
       } finally {
@@ -263,6 +296,7 @@ export function useRestoreThread(
     isRestoring,
     isStreamActive,
     isCatchingUp,
+    reconnectPhase,
     currentActivity,
     currentReasoning,
     restoredSegment,

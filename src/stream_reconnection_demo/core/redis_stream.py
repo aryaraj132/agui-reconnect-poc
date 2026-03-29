@@ -177,6 +177,51 @@ class RedisStreamManager:
         """Return the active run_id for a thread, or None."""
         return await self._redis.get(self._active_key(thread_id))
 
+    async def get_last_event_timestamp(self, thread_id: str, run_id: str) -> float | None:
+        """Return the Unix timestamp of the most recent event in the stream.
+
+        Uses XREVRANGE with COUNT 1 to efficiently get the last entry.
+        Returns None if the stream is empty or doesn't exist.
+        """
+        key = self._stream_key(thread_id, run_id)
+        entries = await self._redis.xrevrange(key, count=1)
+        if not entries:
+            return None
+        _msg_id, fields = entries[0]
+        ts_str = fields.get("ts", "")
+        if ts_str:
+            try:
+                dt = datetime.fromisoformat(ts_str)
+                return dt.timestamp()
+            except (ValueError, TypeError):
+                pass
+        # Fallback: parse the Redis message ID (millisecond timestamp)
+        msg_id_str = entries[0][0]
+        try:
+            return int(msg_id_str.split("-")[0]) / 1000.0
+        except (ValueError, IndexError):
+            return None
+
+    async def clear_active_run(self, thread_id: str) -> None:
+        """Delete the active_run key for a thread.
+
+        Used during stale run cleanup to allow new runs to start.
+        """
+        await self._redis.delete(self._active_key(thread_id))
+        logger.info("Cleared active_run for thread %s", thread_id)
+
+    async def push_run_history(self, thread_id: str, run_id: str) -> None:
+        """Append a run_id to the thread's run history list."""
+        key = f"run_history:{thread_id}"
+        await self._redis.rpush(key, run_id)
+        await self._redis.expire(key, STREAM_TTL)
+        logger.info("Pushed run %s to history for thread %s", run_id, thread_id)
+
+    async def get_run_history(self, thread_id: str) -> list[str]:
+        """Return all run_ids for a thread in chronological order."""
+        key = f"run_history:{thread_id}"
+        return await self._redis.lrange(key, 0, -1)
+
     async def find_stream(self, thread_id: str) -> str | None:
         """Find any stream (active or completed) for a thread.
 

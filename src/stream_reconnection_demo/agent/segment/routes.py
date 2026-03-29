@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
+from typing import AsyncIterator
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -121,6 +122,191 @@ NODE_META = {
 TOTAL_NODES = len(NODE_META)
 
 
+async def run_segment_pipeline(
+    segment_graph,
+    query: str,
+    thread_id: str,
+    run_id: str,
+    prior_messages: list[dict] | None = None,
+) -> AsyncIterator[str]:
+    message_id = str(uuid.uuid4())
+
+    yield emitter.emit_run_started(thread_id, run_id)
+
+    if prior_messages:
+        yield emitter.emit_messages_snapshot(prior_messages)
+
+    try:
+        graph_input = {
+            "messages": [HumanMessage(content=query)],
+            "segment": None,
+            "error": None,
+            "current_node": "",
+            "requirements": None,
+            "entities": [],
+            "validated_fields": [],
+            "operator_mappings": [],
+            "conditions_draft": [],
+            "optimized_conditions": [],
+            "scope_estimate": None,
+        }
+
+        result_segment = None
+
+        async for chunk in segment_graph.astream(
+            graph_input, stream_mode="updates"
+        ):
+            # chunk is {node_name: state_update_dict}
+            for node_name, node_output in chunk.items():
+                if node_name not in NODE_META:
+                    continue
+
+                meta = NODE_META[node_name]
+
+                # --- STEP START ---
+                yield emitter.emit_step_start(node_name)
+
+                # --- TOOL CALL: update_progress_status ---
+                tool_call_id = str(uuid.uuid4())
+                yield emitter.emit_tool_call_start(
+                    tool_call_id, "update_progress_status", message_id
+                )
+                yield emitter.emit_tool_call_args(
+                    tool_call_id,
+                    json.dumps({
+                        "status": meta["status"],
+                        "node": node_name,
+                        "node_index": meta["index"],
+                        "total_nodes": TOTAL_NODES,
+                    }),
+                )
+                yield emitter.emit_tool_call_end(tool_call_id)
+
+                # --- ACTIVITY SNAPSHOT ---
+                activity_id = str(uuid.uuid4())
+                yield emitter.emit_activity_snapshot(
+                    activity_id,
+                    "processing",
+                    {
+                        "title": meta["title"],
+                        "progress": meta["progress"],
+                        "details": meta["details"],
+                    },
+                )
+
+                # --- REASONING EVENTS ---
+                reasoning_id = str(uuid.uuid4())
+                yield emitter.emit_reasoning_start(reasoning_id)
+                yield emitter.emit_reasoning_message_start(reasoning_id)
+                for step in meta["reasoning"]:
+                    yield emitter.emit_reasoning_content(reasoning_id, step)
+                    await asyncio.sleep(0.05)
+                yield emitter.emit_reasoning_message_end(reasoning_id)
+                yield emitter.emit_reasoning_end(reasoning_id)
+
+                # --- STATE DELTA for intermediate results ---
+                delta_ops = []
+                if "requirements" in node_output and node_output["requirements"]:
+                    delta_ops.append({
+                        "op": "add", "path": "/requirements",
+                        "value": node_output["requirements"],
+                    })
+                if "entities" in node_output and node_output["entities"]:
+                    delta_ops.append({
+                        "op": "add", "path": "/entities",
+                        "value": node_output["entities"],
+                    })
+                if "validated_fields" in node_output and node_output["validated_fields"]:
+                    delta_ops.append({
+                        "op": "add", "path": "/validated_fields",
+                        "value": node_output["validated_fields"],
+                    })
+                if "operator_mappings" in node_output and node_output["operator_mappings"]:
+                    delta_ops.append({
+                        "op": "add", "path": "/operator_mappings",
+                        "value": node_output["operator_mappings"],
+                    })
+                if "conditions_draft" in node_output and node_output["conditions_draft"]:
+                    delta_ops.append({
+                        "op": "add", "path": "/conditions_draft",
+                        "value": node_output["conditions_draft"],
+                    })
+                if "optimized_conditions" in node_output and node_output["optimized_conditions"]:
+                    delta_ops.append({
+                        "op": "add", "path": "/optimized_conditions",
+                        "value": node_output["optimized_conditions"],
+                    })
+                if "scope_estimate" in node_output and node_output["scope_estimate"]:
+                    delta_ops.append({
+                        "op": "add", "path": "/scope_estimate",
+                        "value": node_output["scope_estimate"],
+                    })
+                if delta_ops:
+                    yield emitter.emit_state_delta(delta_ops)
+
+                # Capture segment from build_segment node
+                if node_name == "build_segment":
+                    result_segment = node_output.get("segment")
+
+                # --- STEP FINISH ---
+                yield emitter.emit_step_finish(node_name)
+
+        # --- ERROR CHECK ---
+        if result_segment is None:
+            yield emitter.emit_run_error("Segment generation produced no result")
+            return
+
+        # --- FINAL STATE SNAPSHOT ---
+        segment_dict = result_segment.model_dump()
+        thread_store.update_state(thread_id, segment_dict)
+
+        # Activity: 100%
+        yield emitter.emit_activity_snapshot(
+            str(uuid.uuid4()),
+            "processing",
+            {
+                "title": "Segment Complete",
+                "progress": 1.0,
+                "details": f"Generated segment: {result_segment.name}",
+            },
+        )
+
+        yield emitter.emit_state_snapshot(segment_dict)
+
+        # --- TOOL CALL: update_progress_status (completed) ---
+        completion_tool_id = str(uuid.uuid4())
+        yield emitter.emit_tool_call_start(
+            completion_tool_id, "update_progress_status", message_id
+        )
+        yield emitter.emit_tool_call_args(
+            completion_tool_id,
+            json.dumps({
+                "status": "completed",
+                "node": "build_segment",
+                "node_index": TOTAL_NODES - 1,
+                "total_nodes": TOTAL_NODES,
+            }),
+        )
+        yield emitter.emit_tool_call_end(completion_tool_id)
+
+        # --- TEXT MESSAGE ---
+        summary = f"Created segment: **{result_segment.name}**\n\n{result_segment.description}"
+        yield emitter.emit_text_start(message_id, "assistant")
+        yield emitter.emit_text_content(message_id, summary)
+        yield emitter.emit_text_end(message_id)
+
+        thread_store.add_message(
+            thread_id, {"role": "assistant", "content": summary}
+        )
+
+    except Exception as e:
+        logging.exception("Segment generation failed")
+        yield emitter.emit_run_error(str(e))
+        return
+
+    yield emitter.emit_run_finished(thread_id, run_id)
+
+
 @router.post("/segment")
 async def generate_segment(request: Request):
     body = await request.json()
@@ -216,183 +402,16 @@ async def generate_segment(request: Request):
     except Exception:
         logging.warning("Redis start_run failed, streaming without persistence")
 
+    try:
+        await redis_manager.push_run_history(thread_id, run_id)
+    except Exception:
+        logging.warning("Redis push_run_history failed")
+
     async def event_stream():
-        message_id = str(uuid.uuid4())
-
-        yield emitter.emit_run_started(thread_id, run_id)
-
-        if prior_messages:
-            yield emitter.emit_messages_snapshot(prior_messages)
-
-        try:
-            graph_input = {
-                "messages": [HumanMessage(content=query)],
-                "segment": None,
-                "error": None,
-                "current_node": "",
-                "requirements": None,
-                "entities": [],
-                "validated_fields": [],
-                "operator_mappings": [],
-                "conditions_draft": [],
-                "optimized_conditions": [],
-                "scope_estimate": None,
-            }
-
-            result_segment = None
-
-            async for chunk in segment_graph.astream(
-                graph_input, stream_mode="updates"
-            ):
-                # chunk is {node_name: state_update_dict}
-                for node_name, node_output in chunk.items():
-                    if node_name not in NODE_META:
-                        continue
-
-                    meta = NODE_META[node_name]
-
-                    # --- STEP START ---
-                    yield emitter.emit_step_start(node_name)
-
-                    # --- TOOL CALL: update_progress_status ---
-                    tool_call_id = str(uuid.uuid4())
-                    yield emitter.emit_tool_call_start(
-                        tool_call_id, "update_progress_status", message_id
-                    )
-                    yield emitter.emit_tool_call_args(
-                        tool_call_id,
-                        json.dumps({
-                            "status": meta["status"],
-                            "node": node_name,
-                            "node_index": meta["index"],
-                            "total_nodes": TOTAL_NODES,
-                        }),
-                    )
-                    yield emitter.emit_tool_call_end(tool_call_id)
-
-                    # --- ACTIVITY SNAPSHOT ---
-                    activity_id = str(uuid.uuid4())
-                    yield emitter.emit_activity_snapshot(
-                        activity_id,
-                        "processing",
-                        {
-                            "title": meta["title"],
-                            "progress": meta["progress"],
-                            "details": meta["details"],
-                        },
-                    )
-
-                    # --- REASONING EVENTS ---
-                    reasoning_id = str(uuid.uuid4())
-                    yield emitter.emit_reasoning_start(reasoning_id)
-                    yield emitter.emit_reasoning_message_start(reasoning_id)
-                    for step in meta["reasoning"]:
-                        yield emitter.emit_reasoning_content(reasoning_id, step)
-                        await asyncio.sleep(0.05)
-                    yield emitter.emit_reasoning_message_end(reasoning_id)
-                    yield emitter.emit_reasoning_end(reasoning_id)
-
-                    # --- STATE DELTA for intermediate results ---
-                    delta_ops = []
-                    if "requirements" in node_output and node_output["requirements"]:
-                        delta_ops.append({
-                            "op": "add", "path": "/requirements",
-                            "value": node_output["requirements"],
-                        })
-                    if "entities" in node_output and node_output["entities"]:
-                        delta_ops.append({
-                            "op": "add", "path": "/entities",
-                            "value": node_output["entities"],
-                        })
-                    if "validated_fields" in node_output and node_output["validated_fields"]:
-                        delta_ops.append({
-                            "op": "add", "path": "/validated_fields",
-                            "value": node_output["validated_fields"],
-                        })
-                    if "operator_mappings" in node_output and node_output["operator_mappings"]:
-                        delta_ops.append({
-                            "op": "add", "path": "/operator_mappings",
-                            "value": node_output["operator_mappings"],
-                        })
-                    if "conditions_draft" in node_output and node_output["conditions_draft"]:
-                        delta_ops.append({
-                            "op": "add", "path": "/conditions_draft",
-                            "value": node_output["conditions_draft"],
-                        })
-                    if "optimized_conditions" in node_output and node_output["optimized_conditions"]:
-                        delta_ops.append({
-                            "op": "add", "path": "/optimized_conditions",
-                            "value": node_output["optimized_conditions"],
-                        })
-                    if "scope_estimate" in node_output and node_output["scope_estimate"]:
-                        delta_ops.append({
-                            "op": "add", "path": "/scope_estimate",
-                            "value": node_output["scope_estimate"],
-                        })
-                    if delta_ops:
-                        yield emitter.emit_state_delta(delta_ops)
-
-                    # Capture segment from build_segment node
-                    if node_name == "build_segment":
-                        result_segment = node_output.get("segment")
-
-                    # --- STEP FINISH ---
-                    yield emitter.emit_step_finish(node_name)
-
-            # --- ERROR CHECK ---
-            if result_segment is None:
-                yield emitter.emit_run_error("Segment generation produced no result")
-                return
-
-            # --- FINAL STATE SNAPSHOT ---
-            segment_dict = result_segment.model_dump()
-            thread_store.update_state(thread_id, segment_dict)
-
-            # Activity: 100%
-            yield emitter.emit_activity_snapshot(
-                str(uuid.uuid4()),
-                "processing",
-                {
-                    "title": "Segment Complete",
-                    "progress": 1.0,
-                    "details": f"Generated segment: {result_segment.name}",
-                },
-            )
-
-            yield emitter.emit_state_snapshot(segment_dict)
-
-            # --- TOOL CALL: update_progress_status (completed) ---
-            completion_tool_id = str(uuid.uuid4())
-            yield emitter.emit_tool_call_start(
-                completion_tool_id, "update_progress_status", message_id
-            )
-            yield emitter.emit_tool_call_args(
-                completion_tool_id,
-                json.dumps({
-                    "status": "completed",
-                    "node": "build_segment",
-                    "node_index": TOTAL_NODES - 1,
-                    "total_nodes": TOTAL_NODES,
-                }),
-            )
-            yield emitter.emit_tool_call_end(completion_tool_id)
-
-            # --- TEXT MESSAGE ---
-            summary = f"Created segment: **{result_segment.name}**\n\n{result_segment.description}"
-            yield emitter.emit_text_start(message_id, "assistant")
-            yield emitter.emit_text_content(message_id, summary)
-            yield emitter.emit_text_end(message_id)
-
-            thread_store.add_message(
-                thread_id, {"role": "assistant", "content": summary}
-            )
-
-        except Exception as e:
-            logging.exception("Segment generation failed")
-            yield emitter.emit_run_error(str(e))
-            return
-
-        yield emitter.emit_run_finished(thread_id, run_id)
+        async for event in run_segment_pipeline(
+            segment_graph, query, thread_id, run_id, prior_messages
+        ):
+            yield event
 
     raw_stream = event_stream()
     stream = LoggingMiddleware().apply(
