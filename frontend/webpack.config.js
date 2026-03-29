@@ -14,6 +14,8 @@ module.exports = {
     extensions: [".tsx", ".ts", ".js"],
     alias: {
       "@": path.resolve(__dirname, "src"),
+      // Force CJS so @ag-ui/client's `import *` gets applyPatch at top level
+      "fast-json-patch": path.resolve(__dirname, "node_modules/fast-json-patch/index.js"),
     },
   },
   module: {

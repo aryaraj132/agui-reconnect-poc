@@ -122,10 +122,10 @@ async def reconnect_stream(thread_id: str, request: Request):
                 "Redis unavailable during reconnect for %s", thread_id
             )
 
-        if run_id is None:
+        if run_id is None or (has_threadstore_state and not is_active):
             if has_threadstore_state:
                 logger.info(
-                    "Reconnect: no Redis stream for %s, ThreadStore state sent",
+                    "Reconnect: completed run for %s, ThreadStore state sent (skip Redis replay)",
                     thread_id,
                 )
                 yield emitter.emit_run_finished(thread_id, synthetic_run_id)
