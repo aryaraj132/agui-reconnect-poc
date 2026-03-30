@@ -1,10 +1,11 @@
-from typing import TypedDict
+from operator import add
+from typing import Annotated, TypedDict
 
 from stream_reconnection_demo.schemas.segment import Segment
 
 
 class SegmentAgentState(TypedDict):
-    messages: list
+    messages: Annotated[list, add]
     segment: Segment | None
     error: str | None
     # Multi-node pipeline tracking

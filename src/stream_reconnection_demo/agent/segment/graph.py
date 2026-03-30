@@ -2,7 +2,7 @@ import asyncio
 import re
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
@@ -307,10 +307,12 @@ def _build_segment_node(llm: ChatAnthropic):
                 HumanMessage(content=query),
             ]
             result = await structured_llm.ainvoke(messages)
+            summary = f"Created segment: **{result.name}**\n\n{result.description}"
             return {
                 "current_node": "build_segment",
                 "segment": result,
                 "error": None,
+                "messages": [AIMessage(content=summary)],
             }
         except Exception as e:
             return {

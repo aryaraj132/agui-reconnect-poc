@@ -558,12 +558,9 @@ async def _handle_stateful_chat(pubsub, segment_graph, thread_id: str, run_id: s
 
                 async def _already_done():
                     yield emitter.emit_run_started(thread_id, run_id)
-                    # Restore chat history
-                    msgs = checkpoint_state.values.get("messages", [])
-                    if msgs:
-                        agui_msgs = emitter.langchain_messages_to_agui(msgs)
-                        if agui_msgs:
-                            yield emitter.emit_messages_snapshot(agui_msgs)
+                    # Do NOT emit MESSAGES_SNAPSHOT here — CopilotKit already
+                    # has the correct messages (including streamed assistant text).
+                    # Emitting checkpointer messages would REPLACE them.
                     # Replay segment state so CopilotKit retains it
                     # (RUN_STARTED resets co-agent state)
                     segment = checkpoint_state.values.get("segment")
