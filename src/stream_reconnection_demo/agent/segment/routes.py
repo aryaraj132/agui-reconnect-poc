@@ -9,12 +9,7 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
 
 from stream_reconnection_demo.core.events import EventEmitter, extract_user_query, get_field
-from stream_reconnection_demo.core.history import thread_store
-from stream_reconnection_demo.core.middleware import (
-    HistoryMiddleware,
-    LoggingMiddleware,
-    RedisStreamMiddleware,
-)
+from stream_reconnection_demo.core.agent_runner import start_agent_task
 
 router = APIRouter(prefix="/api/v1")
 emitter = EventEmitter()
@@ -121,20 +116,52 @@ NODE_META = {
 
 TOTAL_NODES = len(NODE_META)
 
+# Fields that may appear in node output and should be emitted as state deltas
+_DELTA_FIELDS = [
+    "requirements",
+    "entities",
+    "validated_fields",
+    "operator_mappings",
+    "conditions_draft",
+    "optimized_conditions",
+    "scope_estimate",
+]
+
 
 async def run_segment_pipeline(
     segment_graph,
     query: str,
     thread_id: str,
     run_id: str,
-    prior_messages: list[dict] | None = None,
 ) -> AsyncIterator[str]:
+    """Stream AG-UI events from the LangGraph segment pipeline.
+
+    Yields SSE-encoded event strings for each pipeline step including
+    progress, reasoning, state deltas, and the final segment result.
+    """
     message_id = str(uuid.uuid4())
 
     yield emitter.emit_run_started(thread_id, run_id)
 
-    if prior_messages:
-        yield emitter.emit_messages_snapshot(prior_messages)
+    # Clear previous co-agent state so old segment cards don't render
+    # during intermediate steps of this new run
+    yield emitter.emit_state_snapshot({})
+
+    # Reset progress status on the frontend immediately
+    reset_tool_id = str(uuid.uuid4())
+    yield emitter.emit_tool_call_start(reset_tool_id, "update_progress_status", message_id)
+    yield emitter.emit_tool_call_args(
+        reset_tool_id,
+        json.dumps({
+            "status": "starting",
+            "node": "",
+            "node_index": -1,
+            "total_nodes": TOTAL_NODES,
+        }),
+    )
+    yield emitter.emit_tool_call_end(reset_tool_id)
+
+    config = {"configurable": {"thread_id": thread_id}}
 
     try:
         graph_input = {
@@ -154,7 +181,7 @@ async def run_segment_pipeline(
         result_segment = None
 
         async for chunk in segment_graph.astream(
-            graph_input, stream_mode="updates"
+            graph_input, config=config, stream_mode="updates"
         ):
             # chunk is {node_name: state_update_dict}
             for node_name, node_output in chunk.items():
@@ -206,41 +233,13 @@ async def run_segment_pipeline(
 
                 # --- STATE DELTA for intermediate results ---
                 delta_ops = []
-                if "requirements" in node_output and node_output["requirements"]:
-                    delta_ops.append({
-                        "op": "add", "path": "/requirements",
-                        "value": node_output["requirements"],
-                    })
-                if "entities" in node_output and node_output["entities"]:
-                    delta_ops.append({
-                        "op": "add", "path": "/entities",
-                        "value": node_output["entities"],
-                    })
-                if "validated_fields" in node_output and node_output["validated_fields"]:
-                    delta_ops.append({
-                        "op": "add", "path": "/validated_fields",
-                        "value": node_output["validated_fields"],
-                    })
-                if "operator_mappings" in node_output and node_output["operator_mappings"]:
-                    delta_ops.append({
-                        "op": "add", "path": "/operator_mappings",
-                        "value": node_output["operator_mappings"],
-                    })
-                if "conditions_draft" in node_output and node_output["conditions_draft"]:
-                    delta_ops.append({
-                        "op": "add", "path": "/conditions_draft",
-                        "value": node_output["conditions_draft"],
-                    })
-                if "optimized_conditions" in node_output and node_output["optimized_conditions"]:
-                    delta_ops.append({
-                        "op": "add", "path": "/optimized_conditions",
-                        "value": node_output["optimized_conditions"],
-                    })
-                if "scope_estimate" in node_output and node_output["scope_estimate"]:
-                    delta_ops.append({
-                        "op": "add", "path": "/scope_estimate",
-                        "value": node_output["scope_estimate"],
-                    })
+                for field_name in _DELTA_FIELDS:
+                    if field_name in node_output and node_output[field_name]:
+                        delta_ops.append({
+                            "op": "add",
+                            "path": f"/{field_name}",
+                            "value": node_output[field_name],
+                        })
                 if delta_ops:
                     yield emitter.emit_state_delta(delta_ops)
 
@@ -258,7 +257,6 @@ async def run_segment_pipeline(
 
         # --- FINAL STATE SNAPSHOT ---
         segment_dict = result_segment.model_dump()
-        thread_store.update_state(thread_id, segment_dict)
 
         # Activity: 100%
         yield emitter.emit_activity_snapshot(
@@ -295,10 +293,6 @@ async def run_segment_pipeline(
         yield emitter.emit_text_content(message_id, summary)
         yield emitter.emit_text_end(message_id)
 
-        thread_store.add_message(
-            thread_id, {"role": "assistant", "content": summary}
-        )
-
     except Exception as e:
         logging.exception("Segment generation failed")
         yield emitter.emit_run_error(str(e))
@@ -307,119 +301,225 @@ async def run_segment_pipeline(
     yield emitter.emit_run_finished(thread_id, run_id)
 
 
+# ---------------------------------------------------------------------------
+# Intent-based request handlers
+# ---------------------------------------------------------------------------
+
+
+async def _handle_connect(pubsub, segment_graph, thread_id, run_id):
+    """Handle a 'connect' request — reconnect to active run or replay state.
+
+    1. If an active run exists in Redis, catch up and follow live events.
+    2. If no active run but a checkpointer snapshot exists, replay it.
+    3. If nothing found, return an empty run (started + finished).
+    """
+    # Check for an active run in Redis
+    active_run_id = None
+    try:
+        active_run_id = await pubsub.get_active_run(thread_id)
+    except Exception:
+        logging.warning("Failed to check active run for thread %s", thread_id)
+
+    if active_run_id:
+        logging.info(
+            "Connect: active run %s found for thread %s — catching up",
+            active_run_id, thread_id,
+        )
+        return StreamingResponse(
+            pubsub.catch_up_and_follow(thread_id, active_run_id),
+            media_type=emitter.content_type,
+        )
+
+    # No active run — try checkpointer for completed state
+    try:
+        checkpoint_state = await segment_graph.aget_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+    except Exception:
+        logging.warning("Failed to read checkpointer for thread %s", thread_id)
+        checkpoint_state = None
+
+    if checkpoint_state and checkpoint_state.values:
+        logging.info(
+            "Connect: checkpointer state found for thread %s — replaying",
+            thread_id,
+        )
+
+        async def _replay_checkpoint():
+            yield emitter.emit_run_started(thread_id, run_id)
+
+            # Restore chat history from checkpointer messages
+            messages = checkpoint_state.values.get("messages", [])
+            if messages:
+                agui_msgs = emitter.langchain_messages_to_agui(messages)
+                if agui_msgs:
+                    yield emitter.emit_messages_snapshot(agui_msgs)
+
+            # Replay segment state so CopilotKit can render the segment card
+            segment = checkpoint_state.values.get("segment")
+            if segment is not None:
+                segment_dict = segment.model_dump() if hasattr(segment, "model_dump") else segment
+                yield emitter.emit_state_snapshot(segment_dict)
+
+                # Restore completed progress status
+                msg_id = str(uuid.uuid4())
+                tool_id = str(uuid.uuid4())
+                yield emitter.emit_tool_call_start(tool_id, "update_progress_status", msg_id)
+                yield emitter.emit_tool_call_args(
+                    tool_id,
+                    json.dumps({
+                        "status": "completed",
+                        "node": "build_segment",
+                        "node_index": TOTAL_NODES - 1,
+                        "total_nodes": TOTAL_NODES,
+                    }),
+                )
+                yield emitter.emit_tool_call_end(tool_id)
+
+            yield emitter.emit_run_finished(thread_id, run_id)
+
+        return StreamingResponse(
+            _replay_checkpoint(), media_type=emitter.content_type
+        )
+
+    # Nothing found — empty run
+    logging.info(
+        "Connect: no state found for thread %s — returning empty run",
+        thread_id,
+    )
+
+    async def _empty_run():
+        yield emitter.emit_run_started(thread_id, run_id)
+        yield emitter.emit_run_finished(thread_id, run_id)
+
+    return StreamingResponse(
+        _empty_run(), media_type=emitter.content_type
+    )
+
+
+async def _handle_chat(pubsub, segment_graph, thread_id, run_id, query):
+    """Handle a 'chat' request — start a new agent run or return completed state.
+
+    If the query is empty, return the current checkpointer state (if any).
+    If a query is provided, start the agent pipeline in the background and
+    stream events via catch-up-and-follow.
+    """
+    if not query or not query.strip():
+        # No query — treat like a connect to restore any existing state.
+        # This handles the case where CopilotKit sends requestType=chat
+        # with empty messages on page reload (frontend lost message history).
+        return await _handle_connect(pubsub, segment_graph, thread_id, run_id)
+
+    # Check if this query was already processed (prevents CopilotKit re-run loop).
+    # CopilotKit re-sends the full messages array after each run completes.
+    # Return a minimal empty run so CopilotKit is satisfied without corrupting state.
+    try:
+        checkpoint_state = await segment_graph.aget_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        if checkpoint_state and checkpoint_state.values:
+            existing_messages = checkpoint_state.values.get("messages", [])
+            last_human = None
+            for msg in reversed(existing_messages):
+                if hasattr(msg, "type") and msg.type == "human":
+                    last_human = msg.content
+                    break
+            if last_human == query:
+                logging.info("Chat: query already processed for thread %s, returning empty run", thread_id)
+
+                async def _already_done():
+                    yield emitter.emit_run_started(thread_id, run_id)
+                    # Restore chat history
+                    msgs = checkpoint_state.values.get("messages", [])
+                    if msgs:
+                        agui_msgs = emitter.langchain_messages_to_agui(msgs)
+                        if agui_msgs:
+                            yield emitter.emit_messages_snapshot(agui_msgs)
+                    # Replay segment state so CopilotKit retains it
+                    # (RUN_STARTED resets co-agent state)
+                    segment = checkpoint_state.values.get("segment")
+                    if segment is not None:
+                        seg_dict = segment.model_dump() if hasattr(segment, "model_dump") else segment
+                        yield emitter.emit_state_snapshot(seg_dict)
+                    yield emitter.emit_run_finished(thread_id, run_id)
+
+                return StreamingResponse(
+                    _already_done(), media_type=emitter.content_type
+                )
+    except Exception:
+        logging.warning("Checkpointer check failed for thread %s", thread_id)
+
+    # Has a query — start agent pipeline in the background
+    try:
+        await pubsub.start_run(thread_id, run_id)
+    except Exception:
+        logging.warning("Redis start_run failed for run %s", run_id)
+
+    pipeline_stream = run_segment_pipeline(
+        segment_graph, query, thread_id, run_id
+    )
+    start_agent_task(pubsub, segment_graph, thread_id, run_id, pipeline_stream)
+
+    # Let the background task start publishing before we begin following
+    await asyncio.sleep(0.1)
+
+    return StreamingResponse(
+        pubsub.catch_up_and_follow(thread_id, run_id),
+        media_type=emitter.content_type,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.get("/segment/state/{thread_id}")
+async def get_segment_state(thread_id: str, request: Request):
+    """Return the current segment state from the checkpointer for a given thread.
+
+    Used by the frontend to restore state on reconnect when CopilotKit's
+    runtime does not forward agent/connect to the backend.
+    """
+    segment_graph = request.app.state.segment_graph
+    try:
+        checkpoint_state = await segment_graph.aget_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        if checkpoint_state and checkpoint_state.values:
+            segment = checkpoint_state.values.get("segment")
+            if segment:
+                seg_dict = segment.model_dump() if hasattr(segment, "model_dump") else segment
+                return {"segment": seg_dict}
+    except Exception:
+        logging.warning("Failed to read state for thread %s", thread_id)
+    return {"segment": None}
+
+
 @router.post("/segment")
 async def generate_segment(request: Request):
+    """Single endpoint for segment pipeline — handles new runs, reconnections,
+    and mid-execution joins via intent detection from request metadata.
+    """
     body = await request.json()
     thread_id = get_field(body, "thread_id", "threadId", str(uuid.uuid4()))
     run_id = get_field(body, "run_id", "runId", str(uuid.uuid4()))
     query = extract_user_query(body.get("messages", []))
 
     segment_graph = request.app.state.segment_graph
-    redis_manager = request.app.state.redis_manager
+    pubsub = request.app.state.pubsub
 
-    # Guard 1: empty query (e.g. CopilotKit's agent/connect with messages: [])
-    if not query.strip():
-        logging.info(
-            "Guard 1: empty query for thread %s (likely agent/connect)",
-            thread_id,
-        )
-        thread = thread_store.get_thread(thread_id)
+    # Detect request type from metadata
+    metadata = body.get("metadata", {})
+    request_type = metadata.get("requestType", "chat")
 
-        async def empty_query_stream():
-            yield emitter.emit_run_started(thread_id, run_id)
-            if thread and thread["messages"]:
-                yield emitter.emit_messages_snapshot(thread["messages"])
-            if thread and thread["state"]:
-                yield emitter.emit_state_snapshot(thread["state"])
-            yield emitter.emit_run_finished(thread_id, run_id)
-
-        return StreamingResponse(
-            empty_query_stream(), media_type=emitter.content_type
-        )
-
-    # Guard 2: Redis has an active or completed stream for this thread.
-    # Prevents CopilotKit's connectAgent() from triggering a new generation
-    # when it replays messages on page reload — even after backend restart
-    # (ThreadStore empty but Redis persists).
-    try:
-        existing_run = await redis_manager.find_stream(thread_id)
-    except Exception:
-        existing_run = None
-
-    if existing_run:
-        logging.info(
-            "Guard 2: existing stream for thread %s (run %s) — returning stored state",
-            thread_id, existing_run,
-        )
-        thread = thread_store.get_thread(thread_id)
-
-        async def already_exists_stream():
-            yield emitter.emit_run_started(thread_id, run_id)
-            if thread and thread["messages"]:
-                yield emitter.emit_messages_snapshot(thread["messages"])
-            if thread and thread["state"]:
-                yield emitter.emit_state_snapshot(thread["state"])
-            yield emitter.emit_run_finished(thread_id, run_id)
-
-        return StreamingResponse(
-            already_exists_stream(), media_type=emitter.content_type
-        )
-
-    # Guard 3: ThreadStore has completed state with same query (no Redis)
-    thread = thread_store.get_or_create_thread(thread_id, "segment")
-    if (
-        thread["state"]
-        and thread["messages"]
-        and thread["messages"][-1].get("role") == "assistant"
-    ):
-        last_user_msg = ""
-        for msg in reversed(thread["messages"]):
-            if msg.get("role") == "user":
-                last_user_msg = msg.get("content", "")
-                break
-        if last_user_msg == query:
-            logging.info(
-                "Guard 3: same query already completed for thread %s",
-                thread_id,
-            )
-
-            async def completed_stream():
-                yield emitter.emit_run_started(thread_id, run_id)
-                yield emitter.emit_messages_snapshot(thread["messages"])
-                yield emitter.emit_state_snapshot(thread["state"])
-                yield emitter.emit_run_finished(thread_id, run_id)
-
-            return StreamingResponse(
-                completed_stream(), media_type=emitter.content_type
-            )
-
-    prior_messages = list(thread["messages"])
-    thread_store.add_message(thread_id, {"role": "user", "content": query})
-
-    # Register this run in Redis
-    try:
-        await redis_manager.start_run(thread_id, run_id)
-    except Exception:
-        logging.warning("Redis start_run failed, streaming without persistence")
-
-    try:
-        await redis_manager.push_run_history(thread_id, run_id)
-    except Exception:
-        logging.warning("Redis push_run_history failed")
-
-    async def event_stream():
-        async for event in run_segment_pipeline(
-            segment_graph, query, thread_id, run_id, prior_messages
-        ):
-            yield event
-
-    raw_stream = event_stream()
-    stream = LoggingMiddleware().apply(
-        HistoryMiddleware(store=thread_store, thread_id=thread_id).apply(
-            RedisStreamMiddleware(redis_manager, thread_id, run_id).apply(
-                raw_stream
-            )
-        )
+    logging.info(
+        "Segment request: type=%s thread=%s run=%s query=%s",
+        request_type, thread_id, run_id, query[:80] if query else "(empty)",
     )
 
-    return StreamingResponse(stream, media_type=emitter.content_type)
+    if request_type == "connect":
+        return await _handle_connect(pubsub, segment_graph, thread_id, run_id)
+
+    # Default: chat
+    return await _handle_chat(pubsub, segment_graph, thread_id, run_id, query)

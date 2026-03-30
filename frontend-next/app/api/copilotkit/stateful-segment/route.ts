@@ -11,8 +11,8 @@ const BACKEND_URL =
 const runtime = new CopilotRuntime({
   agents: {
     default: new LangGraphHttpAgent({
-      url: `${BACKEND_URL}/api/v1/segment`,
-      description: "Segment generation agent",
+      url: `${BACKEND_URL}/api/v1/stateful-segment`,
+      description: "Stateful segment generation agent (checkpointer-only)",
     }),
   },
 });
@@ -21,13 +21,11 @@ export const POST = async (req: Request) => {
   const body = await req.json();
 
   // Intercept agent/connect and proxy directly to the backend.
-  // CopilotKit's InMemoryAgentRunner.connect() uses in-memory state
-  // that is lost on page reload — our backend has the real state.
   if (body.method === "agent/connect") {
     const threadId = body.body?.threadId ?? body.params?.threadId;
     const runId = body.body?.runId ?? crypto.randomUUID();
 
-    const backendResp = await fetch(`${BACKEND_URL}/api/v1/segment`, {
+    const backendResp = await fetch(`${BACKEND_URL}/api/v1/stateful-segment`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -58,7 +56,7 @@ export const POST = async (req: Request) => {
   const { handleRequest } = copilotRuntimeNextJSAppRouterEndpoint({
     runtime,
     serviceAdapter: new EmptyAdapter(),
-    endpoint: "/api/copilotkit/segment",
+    endpoint: "/api/copilotkit/stateful-segment",
   });
   return handleRequest(newReq);
 };

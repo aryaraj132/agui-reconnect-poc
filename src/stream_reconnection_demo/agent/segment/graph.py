@@ -3,6 +3,7 @@ import re
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from stream_reconnection_demo.agent.segment.state import SegmentAgentState
@@ -321,7 +322,10 @@ def _build_segment_node(llm: ChatAnthropic):
     return build_segment
 
 
-def build_segment_graph(model: str = "claude-sonnet-4-20250514"):
+def build_segment_graph(
+    model: str = "claude-sonnet-4-20250514",
+    checkpointer: MemorySaver | None = None,
+):
     """Build and compile the 8-node segment generation graph."""
     llm = ChatAnthropic(model=model)
 
@@ -345,4 +349,4 @@ def build_segment_graph(model: str = "claude-sonnet-4-20250514"):
     graph.add_edge("estimate_scope", "build_segment")
     graph.add_edge("build_segment", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)

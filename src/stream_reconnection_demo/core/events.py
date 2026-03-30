@@ -215,6 +215,22 @@ class EventEmitter:
 
     # -- custom & messages --------------------------------------------------
 
+    @staticmethod
+    def langchain_messages_to_agui(messages: list) -> list[dict[str, Any]]:
+        """Convert LangChain messages to AG-UI format for MESSAGES_SNAPSHOT.
+
+        Maps ``HumanMessage`` (type="human") → role="user" and
+        ``AIMessage`` (type="ai") → role="assistant".
+        """
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            if not hasattr(msg, "type") or not hasattr(msg, "content"):
+                continue
+            role = "user" if msg.type == "human" else "assistant"
+            msg_id = getattr(msg, "id", None) or str(uuid.uuid4())
+            result.append({"id": msg_id, "role": role, "content": msg.content})
+        return result
+
     def emit_custom(self, name: str, value: Any) -> str:
         return self._encoder.encode(CustomEvent(name=name, value=value))
 

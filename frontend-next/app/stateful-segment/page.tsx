@@ -1,4 +1,6 @@
-import { useState, useEffect } from "react";
+"use client";
+
+import { Suspense, useState, useEffect } from "react";
 import {
   CopilotKit,
   useCoAgent,
@@ -12,21 +14,14 @@ import {
   UserMessage as DefaultUserMessage,
   ImageRenderer as DefaultImageRenderer,
 } from "@copilotkit/react-ui";
-import { useAgentThread } from "@/hooks/useAgentThread";
 import { Nav } from "@/components/Nav";
 import { SegmentCard } from "@/components/SegmentCard";
-import { ActivityIndicator } from "@/components/ActivityIndicator";
 import { ReasoningPanel } from "@/components/ReasoningPanel";
+import { ActivityIndicator } from "@/components/ActivityIndicator";
+import { useAgentThread } from "@/hooks/useAgentThread";
 import { ProgressStatus } from "@/components/ProgressStatus";
 import type { Segment } from "@/lib/types";
 
-const isStatefulMode = window.location.pathname.includes("stateful");
-const COPILOT_RUNTIME_URL = isStatefulMode
-  ? (process.env.COPILOT_STATEFUL_RUNTIME_URL || "/copilotkit-stateful")
-  : (process.env.COPILOT_RUNTIME_URL || "/copilotkit");
-
-// Renders the segment card inline in chat by reading co-agent state.
-// Rendered only once — after the last assistant message.
 function InlineSegmentCard() {
   const { state: segment } = useCoAgent<Segment>({ name: "default" });
   if (!segment?.condition_groups) return null;
@@ -41,7 +36,6 @@ function CustomRenderMessage({
 }: RenderMessageProps) {
   if (message.role === "reasoning" || message.role === "activity") {
     if (!inProgress) return null;
-    // Hide if any user message comes after — means this is from a previous turn
     const fromOldTurn = messages.slice(index + 1).some((m) => m.role === "user");
     if (fromOldTurn) return null;
     const hasNewerOfSameRole = messages.slice(index + 1).some((m) => m.role === message.role);
@@ -49,13 +43,9 @@ function CustomRenderMessage({
     if (message.role === "reasoning") return <ReasoningPanel reasoning={message.content} defaultOpen />;
     return <ActivityIndicator activityType={(message as any).activityType ?? "processing"} content={message.content as any} />;
   }
-  if (message.role === "user") {
-    return <UserMessage key={index} rawData={message} message={message} ImageRenderer={ImageRenderer} />;
-  }
+  if (message.role === "user") return <UserMessage key={index} rawData={message} message={message} ImageRenderer={ImageRenderer} />;
   if (message.role === "assistant") {
-    // Hide empty assistant messages created by CopilotKit re-sends
     if (!message.content && !(inProgress && isCurrentMessage)) return null;
-    // Only attach the segment card to the last assistant message that has content
     const showCard = !!message.content && !messages.slice(index + 1).some((m) => m.role === "assistant" && m.content);
     return (
       <>
@@ -75,9 +65,7 @@ function SegmentPageContent() {
   // in CustomRenderMessage (attached to the last assistant message only).
   useCoAgentStateRender({ name: "default", render: () => null });
 
-  const [progressStatus, setProgressStatus] = useState<{
-    status: string; node: string; nodeIndex: number; totalNodes: number;
-  } | null>(null);
+  const [progressStatus, setProgressStatus] = useState<{ status: string; node: string; nodeIndex: number; totalNodes: number } | null>(null);
 
   // Reset progress when co-agent state is cleared (start of new run)
   useEffect(() => {
@@ -120,18 +108,18 @@ function SegmentPageContent() {
   );
 }
 
-export default function App() {
-  const { threadId, ready, startNewThread, switchToThread } = useAgentThread();
+function StatefulSegmentPageInner() {
+  const { threadId, ready } = useAgentThread();
   return (
     <>
       {ready ? (
-        <CopilotKit key={threadId} runtimeUrl={COPILOT_RUNTIME_URL} threadId={threadId}>
+        <CopilotKit key={threadId} runtimeUrl="/api/copilotkit/stateful-segment" threadId={threadId}>
           <CopilotSidebar
             defaultOpen={true}
             RenderMessage={CustomRenderMessage}
             instructions="You are a user segmentation assistant. The user will describe a target audience and you will generate a structured segment definition with conditions."
             labels={{
-              title: "Segment Builder",
+              title: "Segment Builder (Stateful)",
               initial: 'Describe your target audience and I\'ll generate a structured segment.\n\nTry: **"Users from the US who signed up in the last 30 days and made a purchase"**',
             }}
           >
@@ -141,4 +129,8 @@ export default function App() {
       ) : null}
     </>
   );
+}
+
+export default function StatefulSegmentPage() {
+  return <Suspense><StatefulSegmentPageInner /></Suspense>;
 }
