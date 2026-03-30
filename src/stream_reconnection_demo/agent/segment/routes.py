@@ -325,9 +325,32 @@ async def _handle_connect(pubsub, segment_graph, thread_id, run_id):
             "Connect: active run %s found for thread %s — catching up",
             active_run_id, thread_id,
         )
+
+        # Read checkpointer for previous conversation history
+        try:
+            checkpoint_state = await segment_graph.aget_state(
+                {"configurable": {"thread_id": thread_id}}
+            )
+        except Exception:
+            checkpoint_state = None
+
+        async def _reconnect_with_history():
+            first_event = True
+            async for event in pubsub.catch_up_and_follow(thread_id, active_run_id):
+                yield event
+                if first_event:
+                    first_event = False
+                    # Inject MESSAGES_SNAPSHOT right after RUN_STARTED
+                    # so previous conversation history is restored
+                    if checkpoint_state and checkpoint_state.values:
+                        messages = checkpoint_state.values.get("messages", [])
+                        if messages:
+                            agui_msgs = emitter.langchain_messages_to_agui(messages)
+                            if agui_msgs:
+                                yield emitter.emit_messages_snapshot(agui_msgs)
+
         return StreamingResponse(
-            pubsub.catch_up_and_follow(thread_id, active_run_id),
-            media_type=emitter.content_type,
+            _reconnect_with_history(), media_type=emitter.content_type,
         )
 
     # No active run — try checkpointer for completed state
