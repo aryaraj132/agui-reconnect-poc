@@ -60,3 +60,5 @@ fix: lint-fix format
 # Run tests
 test:
     uv run pytest tests/
+dev:
+    just backend & just frontend-next & wait
