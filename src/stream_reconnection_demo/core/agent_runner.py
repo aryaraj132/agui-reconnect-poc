@@ -99,13 +99,14 @@ async def run_agent_pubsub_only(
     Used by the stateful-segment endpoint where catch-up relies on
     checkpointer state instead of event replay.
     """
+    seq_counter = 0
     try:
         async for event_sse in event_stream:
             try:
                 # Publish to Pub/Sub channel only — no RPUSH to List
                 channel_key = pubsub._channel_key(thread_id, run_id)
-                seq = 0  # No sequence tracking without List
-                message = json.dumps({"seq": seq, "event": event_sse})
+                seq_counter += 1
+                message = json.dumps({"seq": seq_counter, "event": event_sse})
                 await pubsub._redis.publish(channel_key, message)
             except Exception:
                 logger.warning("Failed to publish event for run %s", run_id)

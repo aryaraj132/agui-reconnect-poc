@@ -38,3 +38,19 @@ export interface ThreadData {
   created_at: string;
   updated_at: string;
 }
+
+export interface TemplateSection {
+  id: string;
+  type: string;
+  content: string;
+  styles?: Record<string, string>;
+}
+
+export interface EmailTemplate {
+  html: string;
+  css: string;
+  subject: string;
+  preview_text: string;
+  sections: TemplateSection[];
+  version: number;
+}

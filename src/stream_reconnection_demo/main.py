@@ -7,9 +7,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.memory import MemorySaver
 
+from ag_ui_langgraph import LangGraphAgent
 from stream_reconnection_demo.agent.segment.graph import build_segment_graph
 from stream_reconnection_demo.agent.segment.routes import router as segment_router
 from stream_reconnection_demo.agent.stateful_segment.routes import router as stateful_segment_router
+from stream_reconnection_demo.agent.template.graph import build_template_graph
+from stream_reconnection_demo.agent.template.routes import router as template_router
 from stream_reconnection_demo.core.pubsub import RedisPubSubManager
 
 logging.basicConfig(
@@ -31,6 +34,13 @@ async def lifespan(app: FastAPI):
     stateful_checkpointer = MemorySaver()
     app.state.stateful_segment_graph = build_segment_graph(checkpointer=stateful_checkpointer)
     logger.info("Stateful segment graph ready")
+
+    # Build template agent graph with its own checkpointer
+    template_checkpointer = MemorySaver()
+    template_graph = build_template_graph(checkpointer=template_checkpointer)
+    app.state.template_graph = template_graph
+    app.state.template_agent = LangGraphAgent(name="template", graph=template_graph)
+    logger.info("Template agent ready")
 
     # Initialize Redis Pub/Sub manager
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
@@ -69,6 +79,7 @@ app.add_middleware(
 # Single router — all reconnection logic handled within
 app.include_router(segment_router)
 app.include_router(stateful_segment_router)
+app.include_router(template_router)
 
 
 @app.get("/health")
