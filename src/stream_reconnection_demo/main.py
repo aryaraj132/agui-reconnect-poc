@@ -13,7 +13,10 @@ from stream_reconnection_demo.agent.segment.routes import router as segment_rout
 from stream_reconnection_demo.agent.stateful_segment.routes import router as stateful_segment_router
 from stream_reconnection_demo.agent.template.graph import build_template_graph
 from stream_reconnection_demo.agent.template.routes import router as template_router
-from stream_reconnection_demo.core.pubsub import RedisPubSubManager
+from stream_reconnection_demo.core.pubsub import (
+    InMemoryPubSubManager,
+    RedisPubSubManager,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,24 +45,30 @@ async def lifespan(app: FastAPI):
     app.state.template_agent = LangGraphAgent(name="template", graph=template_graph)
     logger.info("Template agent ready")
 
-    # Initialize Redis Pub/Sub manager
+    # Initialize Pub/Sub manager — try Redis, fall back to in-memory
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
     logger.info("Connecting to Redis at %s", redis_url)
     try:
-        app.state.pubsub = RedisPubSubManager(redis_url)
+        pubsub = RedisPubSubManager(redis_url)
+        # Probe the connection to verify Redis is reachable
+        await pubsub._redis.ping()
+        app.state.pubsub = pubsub
         logger.info("Redis Pub/Sub manager initialized")
     except Exception:
-        logger.warning("Redis initialization failed, running without persistence")
-        app.state.pubsub = RedisPubSubManager(redis_url)
+        logger.warning(
+            "Redis unavailable — falling back to in-memory Pub/Sub. "
+            "SSE streaming will work, but reconnection after page reload will not."
+        )
+        app.state.pubsub = InMemoryPubSubManager()
 
     yield
 
     # Cleanup
     try:
         await app.state.pubsub.close()
-        logger.info("Redis connection closed")
+        logger.info("Pub/Sub connection closed")
     except Exception:
-        logger.warning("Redis cleanup failed")
+        logger.warning("Pub/Sub cleanup failed")
 
 
 app = FastAPI(

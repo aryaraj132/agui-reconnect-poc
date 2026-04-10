@@ -7,13 +7,11 @@ to Redis Pub/Sub + List for persistence and live streaming.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import uuid
 from typing import Any, AsyncIterator
 
 from stream_reconnection_demo.core.events import EventEmitter
-from stream_reconnection_demo.core.pubsub import RedisPubSubManager
+from stream_reconnection_demo.core.pubsub import PubSubManager
 
 logger = logging.getLogger(__name__)
 emitter = EventEmitter()
@@ -23,7 +21,7 @@ _running_tasks: dict[str, asyncio.Task] = {}
 
 
 async def run_agent_background(
-    pubsub: RedisPubSubManager,
+    pubsub: PubSubManager,
     segment_graph: Any,
     thread_id: str,
     run_id: str,
@@ -61,7 +59,7 @@ async def run_agent_background(
 
 
 def start_agent_task(
-    pubsub: RedisPubSubManager,
+    pubsub: PubSubManager,
     segment_graph: Any,
     thread_id: str,
     run_id: str,
@@ -88,7 +86,7 @@ def is_agent_running(run_id: str) -> bool:
 
 
 async def run_agent_pubsub_only(
-    pubsub: RedisPubSubManager,
+    pubsub: PubSubManager,
     segment_graph: Any,
     thread_id: str,
     run_id: str,
@@ -103,11 +101,10 @@ async def run_agent_pubsub_only(
     try:
         async for event_sse in event_stream:
             try:
-                # Publish to Pub/Sub channel only — no RPUSH to List
-                channel_key = pubsub._channel_key(thread_id, run_id)
                 seq_counter += 1
-                message = json.dumps({"seq": seq_counter, "event": event_sse})
-                await pubsub._redis.publish(channel_key, message)
+                await pubsub.publish_event_pubsub_only(
+                    thread_id, run_id, event_sse, seq_counter
+                )
             except Exception:
                 logger.warning("Failed to publish event for run %s", run_id)
 
@@ -127,7 +124,7 @@ async def run_agent_pubsub_only(
 
 
 def start_agent_task_pubsub_only(
-    pubsub: RedisPubSubManager,
+    pubsub: PubSubManager,
     segment_graph: Any,
     thread_id: str,
     run_id: str,

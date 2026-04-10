@@ -54,6 +54,11 @@ class EventAdapter:
             where this key is ``None`` are suppressed.
         """
         async for event_obj in agent.run(input_data):
+            logger.debug(
+                "EventAdapter raw event: type=%s name=%s",
+                getattr(event_obj, "type", "?"),
+                getattr(event_obj, "name", getattr(event_obj, "step_name", "?")),
+            )
             # --- Custom event translation ---------------------------------
             if event_obj.type == EventType.CUSTOM:
                 async for translated in self._translate_custom(event_obj):

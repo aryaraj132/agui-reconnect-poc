@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState, useEffect } from "react";
+import { Suspense, useState, useEffect, type ReactNode } from "react";
 import {
   CopilotKit,
   useCoAgent,
@@ -22,9 +22,9 @@ import { useAgentThread } from "@/hooks/useAgentThread";
 import { ProgressStatus } from "@/components/ProgressStatus";
 import type { Segment } from "@/lib/types";
 
-function InlineSegmentCard() {
+function InlineSegmentCard({ fallback }: { fallback?: ReactNode }) {
   const { state: segment } = useCoAgent<Segment>({ name: "default" });
-  if (!segment?.condition_groups) return null;
+  if (!segment?.condition_groups) return <>{fallback}</>;
   return <SegmentCard segment={segment} />;
 }
 
@@ -46,13 +46,12 @@ function CustomRenderMessage({
   if (message.role === "user") return <UserMessage key={index} rawData={message} message={message} ImageRenderer={ImageRenderer} />;
   if (message.role === "assistant") {
     if (!message.content && !(inProgress && isCurrentMessage)) return null;
-    const showCard = !!message.content && !messages.slice(index + 1).some((m) => m.role === "assistant" && m.content);
-    return (
-      <>
-        <AssistantMessage key={index} rawData={message} message={message} isLoading={inProgress && isCurrentMessage && !message.content} isGenerating={inProgress && isCurrentMessage && !!message.content} isCurrentMessage={isCurrentMessage} />
-        {showCard && <InlineSegmentCard />}
-      </>
-    );
+    const isLastAssistant = !!message.content && !messages.slice(index + 1).some((m) => m.role === "assistant" && m.content);
+    const assistantMsg = <AssistantMessage key={index} rawData={message} message={message} isLoading={inProgress && isCurrentMessage && !message.content} isGenerating={inProgress && isCurrentMessage && !!message.content} isCurrentMessage={isCurrentMessage} />;
+    if (isLastAssistant) {
+      return <InlineSegmentCard fallback={assistantMsg} />;
+    }
+    return assistantMsg;
   }
   return null;
 }

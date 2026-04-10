@@ -155,7 +155,7 @@ async def _handle_chat(
         state={"template": existing_template, "version": existing_template.get("version", 0) if existing_template else 0},
         tools=[],
         context=[],
-        forwarded_props={},
+        forwarded_props={"stream_subgraphs": True},
     )
 
     adapter = EventAdapter()

@@ -58,6 +58,15 @@
   - [7.1 New Chat Message (Happy Path)](#71-new-chat-message-happy-path)
   - [7.2 Reconnection / Time-Travel](#72-reconnection--time-travel)
   - [7.3 Interrupt and Resume](#73-interrupt-and-resume)
+- [8. Subgraph Event Streaming](#8-subgraph-event-streaming)
+  - [8.1 LangGraph Subgraph Basics](#81-langgraph-subgraph-basics)
+  - [8.2 The stream\_subgraphs Forwarded Prop](#82-the-stream_subgraphs-forwarded-prop)
+  - [8.3 The Unused is\_subgraph\_stream Flag](#83-the-unused-is_subgraph_stream-flag)
+  - [8.4 No stream\_mode Property](#84-no-stream_mode-property)
+  - [8.5 Test Results: Automatic Events](#85-test-results-automatic-events)
+  - [8.6 Test Results: Custom Events from Subgraphs](#86-test-results-custom-events-from-subgraphs)
+  - [8.7 Fan-Out/Fan-In Pattern](#87-fan-outfan-in-pattern)
+  - [8.8 Recommendations](#88-recommendations)
 
 ---
 
@@ -1425,6 +1434,252 @@ Step 3: Third request -- client sends resume value in forwarded_props
         -> graph.astream_events(input=Command(resume=...), ...)
         -> Normal event loop continues from the interrupt point
 ```
+
+---
+
+## 8. Subgraph Event Streaming
+
+This section documents how `ag-ui-langgraph` handles events from LangGraph subgraphs — nested `StateGraph` instances that execute as part of a parent graph. We tested two integration approaches and measured what AG-UI events are visible at the route level.
+
+### 8.1 LangGraph Subgraph Basics
+
+LangGraph supports two ways to compose subgraphs:
+
+**Approach A — Native Composition:**
+```python
+analysis_subgraph = build_analysis_graph().compile()
+parent_graph.add_node("analyze_template", analysis_subgraph)
+```
+A compiled `StateGraph` (which is a `Runnable`) is added directly as a node. LangGraph treats it as a true subgraph — events are namespaced, the subgraph shares state keys with the parent via reducers, and `astream_events()` can include subgraph events.
+
+**Approach B — Manual `ainvoke`:**
+```python
+async def quality_check_node(state, config):
+    result = await quality_graph.ainvoke({"template": state["template"]}, config=config)
+    return {"quality_summary": result.get("quality_summary", "")}
+```
+A wrapper node manually calls `ainvoke()` on a separate compiled graph. The subgraph runs to completion inside the wrapper node. This was expected to hide internal events from the parent's `astream_events()`.
+
+**Fan-Out/Fan-In** (used in Approach A):
+```python
+# Multiple edges from START = parallel execution
+graph.add_edge(START, "analyze_subject")
+graph.add_edge(START, "analyze_colors")
+graph.add_edge(START, "analyze_typography")
+graph.add_edge(START, "analyze_structure")
+
+# All converge to a single node via Annotated[list, add] reducer
+graph.add_edge("analyze_subject", "overall_analysis")
+graph.add_edge("analyze_colors", "overall_analysis")
+graph.add_edge("analyze_typography", "overall_analysis")
+graph.add_edge("analyze_structure", "overall_analysis")
+```
+
+### 8.2 The `stream_subgraphs` Forwarded Prop
+
+ag-ui-langgraph reads `stream_subgraphs` from `RunAgentInput.forwarded_props` and passes it to `astream_events()`:
+
+```python
+# agent.py, lines 450-459
+subgraphs_stream_enabled = input.forwarded_props.get('stream_subgraphs') \
+    if input.forwarded_props else False
+
+kwargs = self.get_stream_kwargs(
+    input=stream_input,
+    config=config,
+    subgraphs=bool(subgraphs_stream_enabled),
+    version="v2",
+)
+stream = self.graph.astream_events(**kwargs)
+```
+
+To enable it from the endpoint:
+```python
+input_data = RunAgentInput(
+    ...,
+    forwarded_props={"stream_subgraphs": True},
+)
+```
+
+This is NOT a constructor parameter on `LangGraphAgent` — it's a per-request runtime flag passed through `forwarded_props`.
+
+### 8.3 The Unused `is_subgraph_stream` Flag
+
+Inside the core event loop (`_handle_stream_events()`), the library detects subgraph events:
+
+```python
+# agent.py, lines 194-198
+async for event in stream:
+    subgraphs_stream_enabled = input.forwarded_props.get('stream_subgraphs') \
+        if input.forwarded_props else False
+    is_subgraph_stream = (subgraphs_stream_enabled and (
+        event.get("event", "").startswith("events") or
+        event.get("event", "").startswith("values")
+    ))
+```
+
+**However, `is_subgraph_stream` is never used.** The variable is computed on every iteration but is never referenced in any conditional, filter, or logging statement. This has two implications:
+
+1. **No filtering occurs:** All subgraph events flow through the same processing pipeline as parent events. There is no special handling, suppression, or transformation based on subgraph origin.
+2. **Likely incomplete implementation:** The detection logic suggests future plans to differentiate subgraph events (perhaps for filtering or special rendering), but the feature was never completed in v0.0.29.
+
+### 8.4 No `stream_mode` Property
+
+A common misconception: **`LangGraphAgent` does NOT have a `stream_mode` property.**
+
+The library exclusively uses `astream_events()` — the LangChain Runnable-level event streaming API that emits callback events (`on_chain_start`, `on_chat_model_stream`, `on_tool_start`, etc.).
+
+LangGraph's `stream_mode` parameter (`"values"`, `"updates"`, `"custom"`, `"messages"`, `"checkpoints"`, `"tasks"`, `"debug"`) applies only to the native `.stream()` / `.astream()` methods, which are a completely different streaming paradigm:
+
+| API | Events | Used by |
+|-----|--------|---------|
+| `graph.astream_events()` | LangChain callbacks (`on_chain_start`, `on_chat_model_stream`, etc.) | ag-ui-langgraph |
+| `graph.astream(stream_mode=...)` | LangGraph state updates (`values`, `updates`, etc.) | Manual implementations (e.g., segment agent) |
+
+The `subgraphs` parameter exists on both APIs but controls different things:
+- `astream_events(subgraphs=True)`: Include callback events from subgraph runnables
+- `astream(subgraphs=True)`: Include state updates from subgraph steps (emitted as `(namespace, data)` tuples)
+
+### 8.5 Test Results: Automatic Events
+
+We tested both subgraph approaches with `stream_subgraphs=True` and `stream_subgraphs=False`. The test used a real email template generation followed by:
+- **Subgraph A (native):** 4 parallel analysis nodes → overall_analysis → apply_improvements
+- **Subgraph B (ainvoke):** check_spelling → check_tone → check_cta → aggregate_quality
+
+#### Event Counts Comparison
+
+| Event Type | `stream_subgraphs=True` | `stream_subgraphs=False` |
+|-----------|------------------------|-------------------------|
+| `STEP_STARTED` / `STEP_FINISHED` | 184 | 206 |
+| `TEXT_MESSAGE_CONTENT` | 1,325 | 1,472 |
+| `TEXT_MESSAGE_START` / `END` | 9 / 9 | 9 / 9 |
+| `TOOL_CALL_START` / `END` | 2 / 2 | 2 / 2 |
+| `STATE_SNAPSHOT` | 15 | 15 |
+| `ACTIVITY_SNAPSHOT` | 9 | 9 |
+| `RUN_STARTED` / `RUN_FINISHED` | 1 / 1 | 1 / 1 |
+| `MESSAGES_SNAPSHOT` | 1 | 1 |
+| `RAW` | 4,559 | 4,672 |
+
+**Minor count differences** in STEP and TEXT events are due to LLM response length variation between runs, not the `stream_subgraphs` setting.
+
+#### STEP Events by Node Name
+
+All node names from both subgraphs appeared in STEP events **regardless of `stream_subgraphs` setting**:
+
+| Node Name | Source | `True` | `False` |
+|-----------|--------|--------|---------|
+| `__start__` | Parent | 1 | 1 |
+| `generate_template` | Parent | 1 | 1 |
+| `analyze_template` | Parent (subgraph wrapper) | 2 | 2 |
+| `analyze_subject` | Subgraph A (native) | 16 | 24 |
+| `analyze_colors` | Subgraph A (native) | 53 | 35 |
+| `analyze_typography` | Subgraph A (native) | 38 | 69 |
+| `analyze_structure` | Subgraph A (native) | 65 | 66 |
+| `overall_analysis` | Subgraph A (native) | 1 | 1 |
+| `apply_improvements` | Subgraph A (native) | 1 | 1 |
+| `quality_check` | Parent (wrapper) | 2 | 2 |
+| `check_spelling` | Subgraph B (ainvoke) | 1 | 1 |
+| `check_tone` | Subgraph B (ainvoke) | 1 | 1 |
+| `check_cta` | Subgraph B (ainvoke) | 1 | 1 |
+| `aggregate_quality` | Subgraph B (ainvoke) | 1 | 1 |
+
+**Key finding:** The `stream_subgraphs` flag has **no observable effect** on event visibility. All subgraph events flow through regardless. This is because:
+
+1. `astream_events()` hooks into LangChain's callback system
+2. When `config` is passed through to subgraph calls (both native and ainvoke), callback handlers propagate
+3. The `is_subgraph_stream` detection code computes a flag but never uses it for filtering
+
+**Parallel node oscillation:** The high STEP counts for parallel nodes (e.g., `analyze_structure: 65`) occur because `_handle_stream_events()` tracks the "current node" and emits `STEP_STARTED`/`STEP_FINISHED` every time the node changes. With 4 parallel nodes, the event stream oscillates rapidly between them, generating many step transitions.
+
+### 8.6 Test Results: Custom Events from Subgraphs
+
+We added `adispatch_custom_event("activity_snapshot", ...)` calls to nodes in both subgraphs to test custom event propagation:
+
+| Custom Event Title | Source | Visible? |
+|-------------------|--------|----------|
+| "Generating template" | Parent (generate_template) | Yes |
+| "Template generated" | Parent (generate_template) | Yes |
+| "Analyzing subject line" | Subgraph A (analyze_subject) | **Yes** |
+| "Subject analysis complete" | Subgraph A (analyze_subject) | **Yes** |
+| "Synthesizing analyses" | Subgraph A (overall_analysis) | **Yes** |
+| "Overall analysis complete" | Subgraph A (overall_analysis) | **Yes** |
+| "Checking spelling" | Subgraph B (check_spelling) | **Yes** |
+| "Spell check complete" | Subgraph B (check_spelling) | **Yes** |
+| "Aggregating quality reports" | Subgraph B (aggregate_quality) | **Yes** |
+
+**All 9 custom events are visible at the route level, regardless of subgraph approach or `stream_subgraphs` setting.**
+
+Custom events dispatched via `adispatch_custom_event()` propagate through the LangChain callback chain. As long as the `config` (which carries the callback handlers) is passed to the subgraph's node functions, custom events reach the parent's `astream_events()` output and are translated by the EventAdapter into `ACTIVITY_SNAPSHOT` AG-UI events.
+
+### 8.7 Fan-Out/Fan-In Pattern
+
+The HTML analysis subgraph demonstrates LangGraph's fan-out/fan-in pattern using separate named nodes:
+
+```python
+class AnalysisSubgraphState(TypedDict):
+    template: dict | None
+    analyses: Annotated[list[AnalysisResult], add]  # Reducer for fan-in
+    overall_assessment: str | None
+    needs_improvement: bool
+```
+
+**How it works:**
+1. `START` has edges to all 4 analysis nodes — LangGraph runs them in the same "superstep" (parallel)
+2. Each node returns `{"analyses": [result]}` — a single-element list
+3. The `Annotated[list[AnalysisResult], add]` reducer concatenates all 4 lists using `operator.add`
+4. `overall_analysis` receives the merged list with all 4 results
+
+**Event stream behavior during parallel execution:**
+The `_handle_stream_events()` loop processes events serially even when nodes run in parallel. As LLM responses stream from 4 concurrent API calls, events interleave:
+
+```
+STEP_STARTED: analyze_subject
+RAW: on_chat_model_stream (analyze_subject)
+STEP_FINISHED: analyze_subject
+STEP_STARTED: analyze_colors     <- oscillation
+RAW: on_chat_model_stream (analyze_colors)
+STEP_FINISHED: analyze_colors
+STEP_STARTED: analyze_subject    <- back to subject
+...
+```
+
+This creates many rapid STEP transitions. The `handle_node_change()` method emits `STEP_FINISHED` for the previous node and `STEP_STARTED` for the new one each time `langgraph_node` changes in the event metadata.
+
+### 8.8 Recommendations
+
+#### When to use each subgraph approach
+
+| Criterion | Native Composition (A) | Manual ainvoke (B) |
+|-----------|----------------------|-------------------|
+| Event visibility | All events visible | All events visible (if config passed) |
+| State sharing | Shares keys with parent via reducers | Fully isolated state |
+| Parallel execution | Supported via fan-out edges | Not applicable (runs inside single node) |
+| Code complexity | Lower (LangGraph handles wiring) | Higher (manual input/output mapping) |
+| Event isolation | Cannot isolate events | Can isolate by NOT passing parent config |
+| Best for | Multi-step pipelines that share state | Independent analyses with separate state |
+
+#### If you need event isolation for Subgraph B
+
+To actually hide events from a manually invoked subgraph, do NOT pass the parent `config`:
+
+```python
+# Events will propagate (current behavior):
+result = await quality_graph.ainvoke({"template": template}, config=config)
+
+# Events will be isolated (no parent callback propagation):
+result = await quality_graph.ainvoke({"template": template})
+```
+
+**Warning:** Not passing `config` also means the subgraph won't use the parent's checkpointer, thread_id, or other configuration. This is a trade-off.
+
+#### The `stream_subgraphs` flag is currently inert
+
+In ag-ui-langgraph v0.0.29, setting `stream_subgraphs` to `True` or `False` has no practical effect because:
+1. The `is_subgraph_stream` detection code never filters events
+2. Event propagation happens at the LangChain callback level, which is orthogonal to the `subgraphs` parameter
+3. All subgraph events (automatic and custom) flow through regardless
+
+This may change in future versions if the library implements actual filtering based on the `is_subgraph_stream` flag.
 
 ---
 

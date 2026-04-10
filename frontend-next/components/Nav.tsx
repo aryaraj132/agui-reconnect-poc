@@ -8,6 +8,7 @@ export function Nav() {
 
   const tabs = [
     { href: "/segment", label: "Segment Builder" },
+    { href: "/stateful-segment", label: "Stateful Segment" },
     { href: "/template", label: "Template Builder" },
   ];
 

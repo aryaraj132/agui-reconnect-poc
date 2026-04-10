@@ -128,6 +128,19 @@ NODE_STATE_FIELDS = {
 }
 
 
+def _extract_step_name_from_sse(event_data: str) -> str | None:
+    """Extract the step name from a STEP_STARTED SSE event string."""
+    for line in event_data.split("\n"):
+        if line.startswith("data:"):
+            json_str = line[5:].lstrip()
+            try:
+                payload = json.loads(json_str)
+                return payload.get("stepName") or payload.get("step_name")
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
 async def run_stateful_segment_pipeline(
     segment_graph,
     query: str,
@@ -270,16 +283,38 @@ async def run_stateful_segment_pipeline(
     yield emitter.emit_run_finished(thread_id, run_id)
 
 
-def _reconstruct_progress_from_state(state: dict) -> tuple[str | None, int]:
+def _reconstruct_progress_from_state(
+    state: dict, next_nodes: tuple = ()
+) -> tuple[str | None, int]:
     """Determine the last completed node from checkpointer state.
+
+    Uses ``next_nodes`` (from ``checkpoint_state.next``) when available —
+    this is authoritative because it tells us which node is scheduled to
+    run next.  Falls back to state-field inspection for completed runs
+    where ``next_nodes`` is empty.
 
     Returns (last_completed_node, completed_count).
     """
+    # Prefer checkpoint metadata: next_nodes tells us exactly which node
+    # is queued, so everything before it has completed.
+    if next_nodes:
+        next_node = next_nodes[0]
+        try:
+            idx = NODE_ORDER.index(next_node)
+            if idx > 0:
+                return NODE_ORDER[idx - 1], idx
+            return None, 0
+        except ValueError:
+            pass  # Unknown node — fall through to state inspection
+
+    # Fallback for completed runs (next_nodes is empty) or when metadata
+    # is unavailable.  Safe here because a completed pipeline has real
+    # values in every field (not just initial empty lists).
     last_completed = None
     completed_count = 0
     for node_name in NODE_ORDER:
         field = NODE_STATE_FIELDS.get(node_name)
-        if field and state.get(field):
+        if field and state.get(field) is not None:
             last_completed = node_name
             completed_count += 1
         else:
@@ -288,7 +323,7 @@ def _reconstruct_progress_from_state(state: dict) -> tuple[str | None, int]:
 
 
 async def _emit_synthetic_catchup(
-    state: dict, thread_id: str, run_id: str
+    state: dict, thread_id: str, run_id: str, next_nodes: tuple = ()
 ) -> AsyncIterator[str]:
     """Emit synthetic AG-UI events from checkpointer state for catch-up.
 
@@ -305,17 +340,22 @@ async def _emit_synthetic_catchup(
         if agui_msgs:
             yield emitter.emit_messages_snapshot(agui_msgs)
 
-    # Emit synthetic progress for completed nodes
-    last_node, completed_count = _reconstruct_progress_from_state(state)
-    if last_node:
-        meta = NODE_META[last_node]
+    # Emit synthetic progress for each completed node with small delays
+    # so the UI can render each step visibly (mimics normal flow pacing)
+    _, completed_count = _reconstruct_progress_from_state(state, next_nodes)
+    for i in range(completed_count):
+        node_name = NODE_ORDER[i]
+        meta = NODE_META[node_name]
+
+        yield emitter.emit_step_start(node_name)
+
         tool_call_id = str(uuid.uuid4())
         yield emitter.emit_tool_call_start(tool_call_id, "update_progress_status", message_id)
         yield emitter.emit_tool_call_args(
             tool_call_id,
             json.dumps({
                 "status": meta["status"],
-                "node": last_node,
+                "node": node_name,
                 "node_index": meta["index"],
                 "total_nodes": TOTAL_NODES,
             }),
@@ -324,7 +364,18 @@ async def _emit_synthetic_catchup(
 
         yield emitter.emit_activity_snapshot(
             str(uuid.uuid4()), "processing",
-            {"title": meta["title"], "progress": meta["progress"], "details": f"Completed {completed_count}/{TOTAL_NODES} steps"},
+            {"title": meta["title"], "progress": meta["progress"], "details": meta["details"]},
+        )
+
+        yield emitter.emit_step_finish(node_name)
+
+    # If pipeline is still running, show indicator for the next node
+    if 0 < completed_count < TOTAL_NODES:
+        next_node = NODE_ORDER[completed_count]
+        next_meta = NODE_META[next_node]
+        yield emitter.emit_activity_snapshot(
+            str(uuid.uuid4()), "processing",
+            {"title": next_meta["title"], "progress": next_meta["progress"], "details": "Processing..."},
         )
 
     # Emit state snapshot if segment exists
@@ -334,7 +385,7 @@ async def _emit_synthetic_catchup(
         yield emitter.emit_state_snapshot(seg_dict)
 
         # Restore completed progress status
-        if last_node == "build_segment":
+        if completed_count == TOTAL_NODES:
             completion_tool_id = str(uuid.uuid4())
             yield emitter.emit_tool_call_start(completion_tool_id, "update_progress_status", message_id)
             yield emitter.emit_tool_call_args(
@@ -420,13 +471,18 @@ async def _handle_stateful_connect(pubsub, segment_graph, thread_id: str, run_id
         )
 
         async def reconnect_stream():
+            from stream_reconnection_demo.core.pubsub import STREAM_END, STREAM_ERROR
+
             # Step 1: Subscribe to Pub/Sub (buffer live events)
             channel_key = pubsub._channel_key(thread_id, active_run_id)
             ps = pubsub._redis.pubsub()
             await ps.subscribe(channel_key)
 
             try:
-                # Step 2: Read checkpointer state
+                # Step 2: Read checkpointer state and track which nodes
+                # are already covered so we can deduplicate against
+                # live Pub/Sub events that arrive for the same nodes.
+                catchup_node_index = -1
                 try:
                     checkpoint_state = await segment_graph.aget_state(
                         {"configurable": {"thread_id": thread_id}}
@@ -434,14 +490,25 @@ async def _handle_stateful_connect(pubsub, segment_graph, thread_id: str, run_id
                 except Exception:
                     checkpoint_state = None
 
-                # Step 3: Emit synthetic catch-up events from checkpointer
+                # Step 3: Emit synthetic catch-up events from checkpointer.
+                # Pub/Sub events for completed nodes are ephemeral and
+                # already lost, so we must reconstruct them from state.
                 if checkpoint_state and checkpoint_state.values:
+                    next_nodes = getattr(checkpoint_state, "next", ())
+                    _, completed_count = _reconstruct_progress_from_state(
+                        checkpoint_state.values, next_nodes
+                    )
+                    catchup_node_index = completed_count - 1
+
                     async for event in _emit_synthetic_catchup(
-                        checkpoint_state.values, thread_id, run_id
+                        checkpoint_state.values, thread_id, run_id, next_nodes
                     ):
                         yield event
 
-                # Step 4: Yield live events from Pub/Sub (no dedup needed)
+                # Step 4: Yield live events from Pub/Sub, skipping events
+                # for nodes already covered by synthetic catch-up.
+                past_catchup = catchup_node_index < 0
+
                 while True:
                     message = await ps.get_message(
                         ignore_subscribe_messages=True, timeout=5.0
@@ -449,45 +516,43 @@ async def _handle_stateful_connect(pubsub, segment_graph, thread_id: str, run_id
                     if message is None:
                         status = await pubsub.get_run_status(thread_id, active_run_id)
                         if status in ("completed", "error"):
-                            # One final checkpointer read for final state
-                            try:
-                                final_state = await segment_graph.aget_state(
-                                    {"configurable": {"thread_id": thread_id}}
-                                )
-                                if final_state and final_state.values:
-                                    seg = final_state.values.get("segment")
-                                    if seg and hasattr(seg, "model_dump"):
-                                        yield emitter.emit_state_snapshot(seg.model_dump())
-                            except Exception:
-                                pass
-                            yield emitter.emit_run_finished(thread_id, run_id)
+                            if not past_catchup:
+                                yield emitter.emit_run_finished(thread_id, run_id)
                             return
                         continue
 
                     if message["type"] != "message":
                         continue
 
+                    raw = message["data"]
+
+                    # Sentinels are plain strings, not JSON — check first
+                    if raw in (STREAM_END, STREAM_ERROR):
+                        if not past_catchup:
+                            yield emitter.emit_run_finished(thread_id, run_id)
+                        return
+
                     try:
-                        parsed = json.loads(message["data"])
+                        parsed = json.loads(raw)
                         event_data = parsed.get("event", "")
                     except (ValueError, TypeError):
                         continue
 
-                    from stream_reconnection_demo.core.pubsub import STREAM_END, STREAM_ERROR
-                    if event_data in (STREAM_END, STREAM_ERROR):
-                        # Read final state from checkpointer
-                        try:
-                            final_state = await segment_graph.aget_state(
-                                {"configurable": {"thread_id": thread_id}}
-                            )
-                            if final_state and final_state.values:
-                                seg = final_state.values.get("segment")
-                                if seg and hasattr(seg, "model_dump"):
-                                    yield emitter.emit_state_snapshot(seg.model_dump())
-                        except Exception:
-                            pass
-                        yield emitter.emit_run_finished(thread_id, run_id)
-                        return
+                    # Skip events for nodes already covered by catch-up.
+                    # Start yielding once we see a new node or post-pipeline
+                    # event. This prevents progress from jumping backward.
+                    if not past_catchup:
+                        if "STEP_STARTED" in event_data:
+                            step_name = _extract_step_name_from_sse(event_data)
+                            if step_name and step_name in NODE_META:
+                                if NODE_META[step_name]["index"] > catchup_node_index:
+                                    past_catchup = True
+                        elif ("TEXT_MESSAGE_START" in event_data
+                              or "RUN_FINISHED" in event_data):
+                            past_catchup = True
+
+                        if not past_catchup:
+                            continue
 
                     yield event_data
             finally:
@@ -511,7 +576,8 @@ async def _handle_stateful_connect(pubsub, segment_graph, thread_id: str, run_id
 
         async def completed_stream():
             async for event in _emit_synthetic_catchup(
-                checkpoint_state.values, thread_id, run_id
+                checkpoint_state.values, thread_id, run_id,
+                getattr(checkpoint_state, "next", ())
             ):
                 yield event
             yield emitter.emit_run_finished(thread_id, run_id)
@@ -582,7 +648,16 @@ async def _handle_stateful_chat(pubsub, segment_graph, thread_id: str, run_id: s
     except Exception:
         logger.warning("Failed to register run in Redis")
 
-    # Start agent as background task — publish to Pub/Sub only (no List)
+    # Subscribe to Pub/Sub BEFORE starting the task so no events are lost.
+    # Without this, the background task publishes RUN_STARTED (and more)
+    # before subscribe_and_stream connects, causing "First event must be
+    # RUN_STARTED" errors on the frontend.
+    from stream_reconnection_demo.core.pubsub import STREAM_END, STREAM_ERROR
+    channel_key = pubsub._channel_key(thread_id, run_id)
+    ps = pubsub._redis.pubsub()
+    await ps.subscribe(channel_key)
+
+    # Now start the background task — events are buffered in `ps`
     pipeline_stream = run_stateful_segment_pipeline(
         segment_graph, query, thread_id, run_id
     )
@@ -590,16 +665,40 @@ async def _handle_stateful_chat(pubsub, segment_graph, thread_id: str, run_id: s
     from stream_reconnection_demo.core.agent_runner import start_agent_task_pubsub_only
     start_agent_task_pubsub_only(pubsub, segment_graph, thread_id, run_id, pipeline_stream)
 
-    await asyncio.sleep(0.1)
-
-    # Subscribe and stream live events
+    # Stream from the already-subscribed channel
     async def live_stream():
         try:
-            async for event_sse in pubsub.subscribe_and_stream(thread_id, run_id, last_seq=0):
-                yield event_sse
+            while True:
+                msg = await ps.get_message(
+                    ignore_subscribe_messages=True, timeout=5.0
+                )
+                if msg is None:
+                    status = await pubsub.get_run_status(thread_id, run_id)
+                    if status in ("completed", "error", None):
+                        return
+                    continue
+
+                if msg["type"] != "message":
+                    continue
+
+                raw = msg["data"]
+
+                # Sentinels are plain strings, not JSON envelopes
+                if raw in (STREAM_END, STREAM_ERROR):
+                    return
+
+                try:
+                    envelope = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+                yield envelope["event"]
         except Exception:
             logger.exception("Stateful live stream failed for run %s", run_id)
             yield emitter.emit_run_error("Stream failed")
+        finally:
+            await ps.unsubscribe(channel_key)
+            await ps.aclose()
 
     return StreamingResponse(
         live_stream(), media_type=emitter.content_type

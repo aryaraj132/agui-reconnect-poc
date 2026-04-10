@@ -11,6 +11,8 @@ from stream_reconnection_demo.agent.template.state import (
     TemplateOutput,
 )
 from stream_reconnection_demo.schemas.template import EmailTemplate
+from stream_reconnection_demo.agent.template.analysis_graph import build_analysis_graph
+from stream_reconnection_demo.agent.template.quality_graph import build_quality_graph
 
 def _assemble_html(template_dict: dict) -> dict:
     """Build a full HTML document from sections when html is empty."""
@@ -233,6 +235,30 @@ def _build_modify_node(llm: ChatAnthropic):
     return modify_template
 
 
+def _build_quality_check_node(model: str):
+    """Wrapper node that invokes the quality check subgraph via ainvoke().
+
+    This is Approach B — the subgraph is NOT a native LangGraph subgraph.
+    Its internal events are hidden from the parent's astream_events().
+    """
+    quality_graph = build_quality_graph(model=model).compile()
+
+    async def quality_check_node(
+        state: TemplateAgentState, config: RunnableConfig
+    ) -> dict:
+        template = state.get("template")
+        if template is None:
+            return {"quality_summary": "No template to check."}
+
+        result = await quality_graph.ainvoke(
+            {"template": template},
+            config=config,
+        )
+        return {"quality_summary": result.get("quality_summary", "")}
+
+    return quality_check_node
+
+
 def _route_by_state(state: TemplateAgentState) -> str:
     """Route to generate or modify based on whether a template exists."""
     if state.get("template") is None:
@@ -241,14 +267,34 @@ def _route_by_state(state: TemplateAgentState) -> str:
 
 
 def build_template_graph(checkpointer=None, model="claude-sonnet-4-20250514"):
-    """Build and compile the template generation/modification graph."""
+    """Build and compile the template generation/modification graph.
+
+    Includes two subgraphs:
+    - analyze_template: HTML analysis via native LangGraph composition (Approach A)
+    - quality_check: Content quality via manual ainvoke wrapper (Approach B)
+    """
     llm = ChatAnthropic(model=model)
 
     graph = StateGraph(TemplateAgentState, output=TemplateOutput)
+
+    # Original nodes
     graph.add_node("generate_template", _build_generate_node(llm))
     graph.add_node("modify_template", _build_modify_node(llm))
+
+    # Subgraph A: native composition — compiled graph as a node
+    analysis_subgraph = build_analysis_graph(model=model).compile()
+    graph.add_node("analyze_template", analysis_subgraph)
+
+    # Subgraph B: wrapper node using ainvoke internally
+    graph.add_node("quality_check", _build_quality_check_node(model=model))
+
+    # Routing from START
     graph.add_conditional_edges(START, _route_by_state)
-    graph.add_edge("generate_template", END)
-    graph.add_edge("modify_template", END)
+
+    # generate/modify → analyze → quality_check → END
+    graph.add_edge("generate_template", "analyze_template")
+    graph.add_edge("modify_template", "analyze_template")
+    graph.add_edge("analyze_template", "quality_check")
+    graph.add_edge("quality_check", END)
 
     return graph.compile(checkpointer=checkpointer)

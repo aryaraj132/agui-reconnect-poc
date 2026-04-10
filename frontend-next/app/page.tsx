@@ -8,6 +8,12 @@ const agents = [
       "Build audience segments with an 8-step AI pipeline. Features stream reconnection with Redis Pub/Sub event persistence.",
   },
   {
+    href: "/stateful-segment",
+    title: "Segment Builder (Stateful)",
+    description:
+      "Same segment pipeline but catch-up on reconnect uses LangGraph checkpointer state instead of Redis List replay.",
+  },
+  {
     href: "/template",
     title: "Template Builder",
     description:
@@ -25,7 +31,7 @@ export default function Home() {
         <p className="text-sm text-gray-500 text-center mb-10">
           Choose an agent to get started
         </p>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {agents.map((agent) => (
             <Link
               key={agent.href}
