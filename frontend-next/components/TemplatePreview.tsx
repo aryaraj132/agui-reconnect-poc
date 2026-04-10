@@ -42,7 +42,15 @@ export function TemplatePreview({
     doc.close();
 
     if (editable) {
-      doc.designMode = "on";
+      // Make only the inner email table editable, not the grey background
+      const emailTable = doc.querySelector(
+        'table[width="600"], table[style*="max-width:600px"]'
+      );
+      if (emailTable) {
+        (emailTable as HTMLElement).setAttribute("contenteditable", "true");
+        (emailTable as HTMLElement).style.outline = "none";
+      }
+
       doc.addEventListener("input", () => {
         if (!doc.body) return;
         const newHtml = doc.body.innerHTML;

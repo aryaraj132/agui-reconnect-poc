@@ -13,6 +13,9 @@ from stream_reconnection_demo.agent.segment.routes import router as segment_rout
 from stream_reconnection_demo.agent.stateful_segment.routes import router as stateful_segment_router
 from stream_reconnection_demo.agent.template.graph import build_template_graph
 from stream_reconnection_demo.agent.template.routes import router as template_router
+from stream_reconnection_demo.agent.template_editor.fe_tool_agent import build_fe_tool_agent
+from stream_reconnection_demo.agent.template_editor.be_only_agent import build_be_only_agent
+from stream_reconnection_demo.agent.template_editor.routes import router as template_editor_router
 from stream_reconnection_demo.core.pubsub import (
     InMemoryPubSubManager,
     RedisPubSubManager,
@@ -44,6 +47,19 @@ async def lifespan(app: FastAPI):
     app.state.template_graph = template_graph
     app.state.template_agent = LangGraphAgent(name="template", graph=template_graph)
     logger.info("Template agent ready")
+
+    # Build template editor agents (FE-tools + BE-only)
+    te_fe_checkpointer = MemorySaver()
+    te_fe_graph = build_fe_tool_agent(checkpointer=te_fe_checkpointer)
+    app.state.te_fe_graph = te_fe_graph
+    app.state.te_fe_agent = LangGraphAgent(name="template-editor-fe", graph=te_fe_graph)
+    logger.info("Template editor FE-tools agent ready")
+
+    te_be_checkpointer = MemorySaver()
+    te_be_graph = build_be_only_agent(checkpointer=te_be_checkpointer)
+    app.state.te_be_graph = te_be_graph
+    app.state.te_be_agent = LangGraphAgent(name="template-editor-be", graph=te_be_graph)
+    logger.info("Template editor BE-only agent ready")
 
     # Initialize Pub/Sub manager — try Redis, fall back to in-memory
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
@@ -89,6 +105,7 @@ app.add_middleware(
 app.include_router(segment_router)
 app.include_router(stateful_segment_router)
 app.include_router(template_router)
+app.include_router(template_editor_router)
 
 
 @app.get("/health")

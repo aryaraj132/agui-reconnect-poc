@@ -19,6 +19,12 @@ const agents = [
     description:
       "Create and modify email templates with AI. Uses ag-ui-langgraph for automatic AG-UI event generation.",
   },
+  {
+    href: "/template-editor",
+    title: "Template Editor",
+    description:
+      "Drag-and-drop template editor with dual AI modes. FE-tools mode uses AG-UI tool calls for live updates. BE-only mode executes tools server-side.",
+  },
 ];
 
 export default function Home() {
@@ -31,7 +37,7 @@ export default function Home() {
         <p className="text-sm text-gray-500 text-center mb-10">
           Choose an agent to get started
         </p>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
           {agents.map((agent) => (
             <Link
               key={agent.href}

@@ -47,6 +47,7 @@ class EventAdapter:
         state_snapshot_key: str = "template",
         allowed_step_names: set[str] | None = None,
         reasoning_step_names: set[str] | None = None,
+        suppress_tool_calls: bool = False,
     ) -> AsyncIterator[str]:
         """Run the agent and yield SSE-encoded event strings.
 
@@ -94,6 +95,14 @@ class EventAdapter:
             # CopilotKit already has messages from individual TEXT_MESSAGE
             # events during live stream; catch-up emits its own snapshot.
             if event_obj.type == EventType.MESSAGES_SNAPSHOT:
+                continue
+
+            # --- TOOL_CALL suppression (BE-only mode) --------------------
+            if suppress_tool_calls and event_obj.type in (
+                EventType.TOOL_CALL_START,
+                EventType.TOOL_CALL_ARGS,
+                EventType.TOOL_CALL_END,
+            ):
                 continue
 
             # --- STEP event filtering + subgraph tracking -----------------
