@@ -1,6 +1,6 @@
 import json
 
-from langchain_anthropic import ChatAnthropic
+from stream_reconnection_demo.core.llm import DEFAULT_MODEL, get_llm
 from langchain_core.callbacks import adispatch_custom_event
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -112,7 +112,7 @@ sections.
 """
 
 
-def _build_generate_node(llm: ChatAnthropic):
+def _build_generate_node(llm):
     structured_llm = llm.with_structured_output(EmailTemplate)
 
     async def generate_template(
@@ -166,7 +166,7 @@ def _build_generate_node(llm: ChatAnthropic):
     return generate_template
 
 
-def _build_modify_node(llm: ChatAnthropic):
+def _build_modify_node(llm):
     structured_llm = llm.with_structured_output(EmailTemplate)
 
     async def modify_template(
@@ -271,14 +271,14 @@ def _route_by_state(state: TemplateAgentState) -> str:
     return "modify_template"
 
 
-def build_template_graph(checkpointer=None, model="claude-sonnet-4-20250514"):
+def build_template_graph(checkpointer=None, model=DEFAULT_MODEL):
     """Build and compile the template generation/modification graph.
 
     Includes two subgraphs:
     - analyze_template: HTML analysis via native LangGraph composition (Approach A)
     - quality_check: Content quality via manual ainvoke wrapper (Approach B)
     """
-    llm = ChatAnthropic(model=model)
+    llm = get_llm(model)
 
     graph = StateGraph(TemplateAgentState, output=TemplateOutput)
 

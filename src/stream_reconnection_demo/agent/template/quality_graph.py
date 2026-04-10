@@ -9,9 +9,7 @@ parent's ``astream_events()`` output — this is the control case for
 testing subgraph event visibility.
 """
 
-import json
-
-from langchain_anthropic import ChatAnthropic
+from stream_reconnection_demo.core.llm import DEFAULT_MODEL, get_llm
 from langchain_core.callbacks import adispatch_custom_event
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -20,7 +18,6 @@ from langgraph.graph import END, START, StateGraph
 from stream_reconnection_demo.agent.template.state import QualityCheckState
 
 
-QUALITY_MODEL = "claude-sonnet-4-20250514"
 
 
 SPELLING_PROMPT = """\
@@ -114,7 +111,7 @@ def _extract_section_contents(template: dict) -> str:
     return "\n".join(parts)
 
 
-def _build_check_spelling(llm: ChatAnthropic):
+def _build_check_spelling(llm):
     async def check_spelling(
         state: QualityCheckState, config: RunnableConfig
     ) -> dict:
@@ -144,7 +141,7 @@ def _build_check_spelling(llm: ChatAnthropic):
     return check_spelling
 
 
-def _build_check_tone(llm: ChatAnthropic):
+def _build_check_tone(llm):
     async def check_tone(
         state: QualityCheckState, config: RunnableConfig
     ) -> dict:
@@ -164,7 +161,7 @@ def _build_check_tone(llm: ChatAnthropic):
     return check_tone
 
 
-def _build_check_cta(llm: ChatAnthropic):
+def _build_check_cta(llm):
     async def check_cta(
         state: QualityCheckState, config: RunnableConfig
     ) -> dict:
@@ -183,7 +180,7 @@ def _build_check_cta(llm: ChatAnthropic):
     return check_cta
 
 
-def _build_aggregate_quality(llm: ChatAnthropic):
+def _build_aggregate_quality(llm):
     async def aggregate_quality(
         state: QualityCheckState, config: RunnableConfig
     ) -> dict:
@@ -207,14 +204,14 @@ def _build_aggregate_quality(llm: ChatAnthropic):
     return aggregate_quality
 
 
-def build_quality_graph(model: str = QUALITY_MODEL) -> StateGraph:
+def build_quality_graph(model: str = DEFAULT_MODEL) -> StateGraph:
     """Build the content quality check subgraph (not compiled).
 
     Returns an uncompiled StateGraph. The parent graph's wrapper node
     compiles and invokes this via ``ainvoke()`` — it is NOT added
     as a native subgraph node.
     """
-    llm = ChatAnthropic(model=model)
+    llm = get_llm(model)
 
     graph = StateGraph(QualityCheckState)
 

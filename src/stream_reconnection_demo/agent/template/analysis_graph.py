@@ -10,7 +10,7 @@ LangGraph treats it as a true subgraph with namespaced events.
 
 import json
 
-from langchain_anthropic import ChatAnthropic
+from stream_reconnection_demo.core.llm import DEFAULT_MODEL, get_llm
 from langchain_core.callbacks import adispatch_custom_event
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -23,7 +23,6 @@ from stream_reconnection_demo.agent.template.state import (
 from stream_reconnection_demo.schemas.template import EmailTemplate
 
 
-ANALYSIS_MODEL = "claude-sonnet-4-20250514"
 
 
 SUBJECT_ANALYSIS_PROMPT = """\
@@ -168,7 +167,7 @@ def _parse_analysis_json(text: str) -> dict:
     return {"findings": str(text), "suggestions": [], "severity": "low"}
 
 
-def _build_analyze_subject(llm: ChatAnthropic):
+def _build_analyze_subject(llm):
     async def analyze_subject(
         state: AnalysisSubgraphState, config: RunnableConfig
     ) -> dict:
@@ -204,7 +203,7 @@ def _build_analyze_subject(llm: ChatAnthropic):
     return analyze_subject
 
 
-def _build_analyze_colors(llm: ChatAnthropic):
+def _build_analyze_colors(llm):
     async def analyze_colors(
         state: AnalysisSubgraphState, config: RunnableConfig
     ) -> dict:
@@ -227,7 +226,7 @@ def _build_analyze_colors(llm: ChatAnthropic):
     return analyze_colors
 
 
-def _build_analyze_typography(llm: ChatAnthropic):
+def _build_analyze_typography(llm):
     async def analyze_typography(
         state: AnalysisSubgraphState, config: RunnableConfig
     ) -> dict:
@@ -250,7 +249,7 @@ def _build_analyze_typography(llm: ChatAnthropic):
     return analyze_typography
 
 
-def _build_analyze_structure(llm: ChatAnthropic):
+def _build_analyze_structure(llm):
     async def analyze_structure(
         state: AnalysisSubgraphState, config: RunnableConfig
     ) -> dict:
@@ -273,7 +272,7 @@ def _build_analyze_structure(llm: ChatAnthropic):
     return analyze_structure
 
 
-def _build_overall_analysis(llm: ChatAnthropic):
+def _build_overall_analysis(llm):
     async def overall_analysis(
         state: AnalysisSubgraphState, config: RunnableConfig
     ) -> dict:
@@ -318,7 +317,7 @@ def _route_after_overall(state: AnalysisSubgraphState) -> str:
     return END
 
 
-def _build_apply_improvements(llm: ChatAnthropic):
+def _build_apply_improvements(llm):
     structured_llm = llm.with_structured_output(EmailTemplate)
 
     async def apply_improvements(
@@ -349,14 +348,14 @@ def _build_apply_improvements(llm: ChatAnthropic):
     return apply_improvements
 
 
-def build_analysis_graph(model: str = ANALYSIS_MODEL) -> StateGraph:
+def build_analysis_graph(model: str = DEFAULT_MODEL) -> StateGraph:
     """Build the HTML analysis subgraph (not compiled).
 
     Returns an uncompiled StateGraph so the parent can compile it
     as part of its own compilation, or it can be compiled standalone
     for testing.
     """
-    llm = ChatAnthropic(model=model)
+    llm = get_llm(model)
 
     graph = StateGraph(AnalysisSubgraphState)
 

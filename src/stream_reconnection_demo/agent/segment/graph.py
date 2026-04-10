@@ -1,7 +1,7 @@
 import asyncio
 import re
 
-from langchain_anthropic import ChatAnthropic
+from stream_reconnection_demo.core.llm import DEFAULT_MODEL, get_llm
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -266,7 +266,7 @@ async def estimate_scope(state: SegmentAgentState) -> dict:
     }
 
 
-def _build_segment_node(llm: ChatAnthropic):
+def _build_segment_node(llm):
     """Node 4: Use LLM to generate the final structured segment."""
     structured_llm = llm.with_structured_output(Segment)
 
@@ -325,11 +325,11 @@ def _build_segment_node(llm: ChatAnthropic):
 
 
 def build_segment_graph(
-    model: str = "claude-sonnet-4-20250514",
+    model: str = DEFAULT_MODEL,
     checkpointer: MemorySaver | None = None,
 ):
     """Build and compile the 8-node segment generation graph."""
-    llm = ChatAnthropic(model=model)
+    llm = get_llm(model)
 
     graph = StateGraph(SegmentAgentState)
     graph.add_node("analyze_requirements", analyze_requirements)
