@@ -226,9 +226,21 @@ class EventEmitter:
         for msg in messages:
             if not hasattr(msg, "type") or not hasattr(msg, "content"):
                 continue
+            # Skip tool messages — they're internal plumbing, not chat
+            if msg.type in ("tool",):
+                continue
             role = "user" if msg.type == "human" else "assistant"
             msg_id = getattr(msg, "id", None) or str(uuid.uuid4())
-            result.append({"id": msg_id, "role": role, "content": msg.content})
+            content = msg.content
+            # Anthropic AI messages with tool calls use list-of-blocks
+            if isinstance(content, list):
+                content = " ".join(
+                    block.get("text", "") if isinstance(block, dict) else str(block)
+                    for block in content
+                    if not (isinstance(block, dict) and block.get("type") == "tool_use")
+                ).strip()
+            if content:
+                result.append({"id": msg_id, "role": role, "content": content})
         return result
 
     def emit_custom(self, name: str, value: Any) -> str:
@@ -245,8 +257,15 @@ class EventEmitter:
             msg_id = msg.get("id", str(uuid.uuid4()))
             role = msg.get("role", "user")
             content = msg.get("content", "")
+            # Anthropic messages may have structured content blocks
+            if isinstance(content, list):
+                content = " ".join(
+                    block.get("text", "") if isinstance(block, dict) else str(block)
+                    for block in content
+                    if not (isinstance(block, dict) and block.get("type") == "tool_use")
+                ).strip()
             if role == "user":
                 agui_messages.append(UserMessage(id=msg_id, content=content))
-            else:
+            elif content:
                 agui_messages.append(AssistantMessage(id=msg_id, content=content))
         return self._encoder.encode(MessagesSnapshotEvent(messages=agui_messages))

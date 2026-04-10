@@ -27,7 +27,9 @@ export function useAgentThread() {
   useEffect(() => {
     if (!threadFromUrl) {
       const pathname = window.location.pathname;
-      window.history.replaceState(null, "", `${pathname}?thread=${generatedId.current}`);
+      const params = new URLSearchParams(window.location.search);
+      params.set("thread", generatedId.current);
+      window.history.replaceState(null, "", `${pathname}?${params.toString()}`);
       setThreadFromUrl(generatedId.current);
     }
   }, [threadFromUrl]);
@@ -44,7 +46,9 @@ export function useAgentThread() {
   const startNewThread = useCallback(() => {
     const newId = crypto.randomUUID();
     const pathname = window.location.pathname;
-    window.history.pushState(null, "", `${pathname}?thread=${newId}`);
+    const params = new URLSearchParams(window.location.search);
+    params.set("thread", newId);
+    window.history.pushState(null, "", `${pathname}?${params.toString()}`);
     setThreadFromUrl(newId);
   }, []);
 

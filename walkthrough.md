@@ -25,6 +25,8 @@
     - [4.3.3 core/agent_runner.py](#433-coreagent_runnerpy)
     - [4.3.4 core/middleware.py](#434-coremiddlewarepy)
     - [4.3.5 core/event_adapter.py](#435-coreevent_adapterpy)
+    - [4.3.6 core/reconnect.py](#436-corereconnectpy)
+    - [4.3.7 core/llm.py](#437-corellmpy)
   - [4.4 Agent: Segment Pipeline](#44-agent-segment-pipeline)
     - [4.4.1 agent/segment/state.py](#441-agentsegmentstatepy)
     - [4.4.2 agent/segment/graph.py](#442-agentsegmentgraphpy)
@@ -33,8 +35,10 @@
     - [4.5.1 agent/stateful_segment/routes.py](#451-agentstateful_segmentroutespy)
   - [4.6 Agent: Template Builder](#46-agent-template-builder)
     - [4.6.1 agent/template/state.py](#461-agenttemplatestatepy)
-    - [4.6.2 agent/template/graph.py](#462-agenttemplatepy)
-    - [4.6.3 agent/template/routes.py](#463-agenttemplateroutespy)
+    - [4.6.2 agent/template/graph.py](#462-agenttemplategraphpy)
+    - [4.6.3 agent/template/analysis_graph.py](#463-agenttemplateanalysis_graphpy)
+    - [4.6.4 agent/template/quality_graph.py](#464-agenttemplatequality_graphpy)
+    - [4.6.5 agent/template/routes.py](#465-agenttemplateroutespy)
 - [5. Frontend: React + Webpack](#5-frontend-react--webpack)
   - [5.1 Configuration](#51-configuration)
     - [5.1.1 package.json](#511-packagejson)
@@ -78,28 +82,29 @@
   - [7.4 Template Agent Lifecycle](#74-template-agent-lifecycle)
 - [8. Segment vs Template Agent: Feature Comparison](#8-segment-vs-template-agent-feature-comparison)
   - [8.1 Summary Table](#81-summary-table)
-  - [8.2 What the Template Agent Is Missing](#82-what-the-template-agent-is-missing)
-    - [8.2.1 Multi-Step Progress Tracking](#821-multi-step-progress-tracking)
-    - [8.2.2 Reasoning Panels (Simulated)](#822-reasoning-panels-simulated)
-    - [8.2.3 Incremental State Deltas](#823-incremental-state-deltas)
-    - [8.2.4 Redis List Persistence for Full Event Replay](#824-redis-list-persistence-for-full-event-replay)
+  - [8.2 Feature Gaps Closed by Subgraph Architecture](#82-feature-gaps-closed-by-subgraph-architecture)
+    - [8.2.1 Multi-Step Progress Tracking](#821-multi-step-progress-tracking--now-available)
+    - [8.2.2 Reasoning Panels (Real LLM Output)](#822-reasoning-panels--now-available-real-llm-output)
+    - [8.2.3 Incremental State Deltas](#823-incremental-state-deltas--still-not-used)
+    - [8.2.4 Redis List Persistence](#824-redis-list-persistence--intentionally-omitted)
   - [8.3 Workarounds Required with ag-ui-langgraph](#83-workarounds-required-with-ag-ui-langgraph)
-    - [8.3.1 EventAdapter (112 lines)](#831-eventadapter-112-lines)
+    - [8.3.1 EventAdapter (214 lines)](#831-eventadapter-214-lines)
     - [8.3.2 Pub/Sub-Only Agent Runner](#832-pubsub-only-agent-runner)
     - [8.3.3 State Injection via RunAgentInput](#833-state-injection-via-runagentinput)
     - [8.3.4 Custom Event Translation Pattern](#834-custom-event-translation-pattern)
     - [8.3.5 Missing clone() Call (Concurrency Bug)](#835-missing-clone-call-concurrency-bug)
-  - [8.4 What the Library Provides for Free](#84-what-the-library-provides-for-free)
-    - [8.4.1 Automatic Text Message Streaming](#841-automatic-text-message-streaming)
-    - [8.4.2 Automatic MESSAGES_SNAPSHOT](#842-automatic-messages_snapshot)
-    - [8.4.3 Automatic Run Lifecycle](#843-automatic-run-lifecycle)
-    - [8.4.4 State Snapshot Suppression Logic](#844-state-snapshot-suppression-logic)
-    - [8.4.5 Real LLM Reasoning Support](#845-real-llm-reasoning-support)
-    - [8.4.6 Message Format Conversion](#846-message-format-conversion)
-    - [8.4.7 Time-Travel and Interrupt/Resume](#847-time-travel-and-interruptresume)
-  - [8.5 Code Volume Comparison](#85-code-volume-comparison)
-  - [8.6 Frontend Impact](#86-frontend-impact)
-  - [8.7 Verdict: When Each Approach Wins](#87-verdict-when-each-approach-wins)
+  - [8.4 Common Reconnection Handler](#84-common-reconnection-handler)
+  - [8.5 What the Library Provides for Free](#85-what-the-library-provides-for-free)
+    - [8.5.1 Automatic Text Message Streaming](#851-automatic-text-message-streaming)
+    - [8.5.2 Automatic MESSAGES_SNAPSHOT](#852-automatic-messages_snapshot)
+    - [8.5.3 Automatic Run Lifecycle](#853-automatic-run-lifecycle)
+    - [8.5.4 State Snapshot Suppression Logic](#854-state-snapshot-suppression-logic)
+    - [8.5.5 Real LLM Reasoning Support](#855-real-llm-reasoning-support)
+    - [8.5.6 Message Format Conversion](#856-message-format-conversion)
+    - [8.5.7 Time-Travel and Interrupt/Resume](#857-time-travel-and-interruptresume)
+  - [8.6 Code Volume Comparison](#86-code-volume-comparison)
+  - [8.7 Frontend Impact](#87-frontend-impact)
+  - [8.8 Verdict: When Each Approach Wins](#88-verdict-when-each-approach-wins)
 
 ---
 
@@ -116,6 +121,12 @@ The demo implements **two agents** (Segment Builder and Template Builder) with *
 | **ag-ui-langgraph** | Template | `POST /api/v1/template` | Auto (`LangGraphAgent` + `EventAdapter`) | LangGraph MemorySaver |
 
 The segment agent manually emits every AG-UI event (~170 lines in `run_segment_pipeline()`). The template agent uses the `ag-ui-langgraph` library, which wraps `graph.astream_events()` and auto-translates LangGraph internals into AG-UI events. The `EventAdapter` bridges the library into the existing Redis pipeline.
+
+The template agent now has a **3-node pipeline** (generate/modify -> analyze -> quality_check) using two subgraph composition approaches:
+- **Approach A (native composition)**: The analysis subgraph is added as a compiled graph node, so its internal events appear in the parent's `astream_events()`.
+- **Approach B (manual ainvoke)**: The quality check subgraph is invoked via `ainvoke()` inside a wrapper node, hiding its events from the parent.
+
+Both checkpointer-based agents (stateful-segment and template) share a **common reconnection handler** (`core/reconnect.py`) that implements the 3-tier connect pattern.
 
 **Tech stack:**
 
@@ -219,12 +230,33 @@ The tradeoff: catch-up is lower fidelity (the client jumps to the current state 
 
 The template agent uses the `ag-ui-langgraph` library for automatic AG-UI event generation. Instead of manually emitting each event via `EventEmitter`, the library wraps `graph.astream_events()` and translates LangGraph internals into AG-UI events automatically.
 
+The template graph is a **3-node pipeline** with two subgraph composition approaches:
+
+```
+START → _route_by_state() → generate_template ─┐
+                          → modify_template  ───┤
+                                                v
+                                        analyze_template   (Subgraph A: native composition)
+                                          ├─ analyze_subject ─────┐
+                                          ├─ analyze_colors ──────┤ fan-out / fan-in
+                                          ├─ analyze_typography ──┤
+                                          ├─ analyze_structure ───┘
+                                          └─ overall_analysis → [apply_improvements] → END
+                                                v
+                                        quality_check          (Subgraph B: manual ainvoke)
+                                          └─ check_spelling → check_tone → check_cta → aggregate → END
+                                                v
+                                              END
+```
+
 ```
                     New Run (Chat)
 CopilotKit ─POST─> /api/v1/template ──> Start Background Task
   ^                     |                       |
   |                     |                LangGraphAgent.run()
-  |                     |                  → EventAdapter (translates custom events, filters snapshots)
+  |                     |                  → EventAdapter (translates custom events,
+  |                     |                     filters snapshots, converts subgraph
+  |                     |                     text to reasoning events)
   |                     |                  → SSE strings
   |                     |                       |
   |                     v                       v
@@ -233,16 +265,17 @@ CopilotKit ─POST─> /api/v1/template ──> Start Background Task
                     Reconnection (Connect)
 CopilotKit ─POST─> /api/v1/template
   ^                     |
+  |                handle_checkpointer_connect() (core/reconnect.py)
   |                1. Subscribe Pub/Sub (buffer live events)
   |                2. Read checkpointer state (MemorySaver)
-  |                3. Yield synthetic catch-up events (MESSAGES_SNAPSHOT + STATE_SNAPSHOT)
-  |                4. Yield live events (from Pub/Sub)
+  |                3. Yield synthetic catch-up events (progress, analysis, quality, template)
+  |                4. Yield live events (from Pub/Sub, dedup by node index)
   <──── SSE ────────────┘
 ```
 
 The key difference from Strategy 2: **event generation is automated**. The library handles RUN_STARTED/FINISHED, STEP_STARTED/FINISHED, STATE_SNAPSHOT, TEXT_MESSAGE_*, and REASONING_* events. Graph nodes only need to dispatch custom events (via `adispatch_custom_event`) for progress indicators, which the `EventAdapter` translates into proper AG-UI types.
 
-Catch-up on reconnect uses the same checkpointer pattern as Strategy 2 (no Redis List). The LangGraph checkpointer is the single source of truth.
+Both checkpointer-based strategies (2 and 3) share a common reconnection handler (`handle_checkpointer_connect()` in `core/reconnect.py`). Agent-specific catch-up content is provided via a `ReconnectConfig` dataclass with callbacks for emitting synthetic events and determining progress.
 
 ### 2.5 CopilotKit Integration Flow
 
@@ -761,6 +794,162 @@ class EventAdapter:
 
 **Interface**: `stream_events()` → `AsyncIterator[str]` (SSE strings) — the **same interface** as `run_segment_pipeline()` and `run_stateful_segment_pipeline()`, so `agent_runner` needs zero changes. The `state_snapshot_key` parameter makes the adapter reusable for other agents (e.g., `state_snapshot_key="segment"` for a future segment agent migration).
 
+**Subgraph-aware features** (added for the 3-node template pipeline):
+
+- **`allowed_step_names`**: Only STEP_STARTED/FINISHED events for parent-level nodes (e.g., `generate_template`, `analyze_template`, `quality_check`) are emitted. Subgraph-internal step events (e.g., `analyze_subject`, `check_spelling`) are silently dropped. The adapter tracks an `in_subgraph` flag that flips when a non-allowed step starts.
+
+- **`reasoning_step_names`**: TEXT_MESSAGE events from subgraph nodes under specified parent steps are converted to REASONING events. For example, when `current_parent_step == "analyze_template"`, the analysis subgraph's text output (streamed by `LangGraphAgent` from the native subgraph) is wrapped in a single consolidated REASONING panel:
+
+```python
+convert_to_reasoning = (
+    in_subgraph
+    and allowed_step_names
+    and reasoning_step_names
+    and current_parent_step in reasoning_step_names
+)
+
+if convert_to_reasoning:
+    if event_obj.type == EventType.TEXT_MESSAGE_START:
+        if not reasoning_active:
+            yield ReasoningStartEvent(message_id=reasoning_msg_id)
+            yield ReasoningMessageStartEvent(message_id=reasoning_msg_id)
+            reasoning_active = True
+        else:
+            # Separator between analysis outputs
+            yield ReasoningMessageContentEvent(message_id=reasoning_msg_id, delta="\n---\n")
+        continue
+    if event_obj.type == EventType.TEXT_MESSAGE_CONTENT:
+        yield ReasoningMessageContentEvent(message_id=reasoning_msg_id, delta=delta)
+        continue
+```
+
+This enables the analysis subgraph's 4 parallel analysis results to appear as a single collapsible "Chain of Thought" panel in the CopilotKit sidebar.
+
+- **MESSAGES_SNAPSHOT suppression**: The library's auto-generated MESSAGES_SNAPSHOT at stream end is suppressed. CopilotKit already has messages from individual TEXT_MESSAGE events during live streaming; replaying them via MESSAGES_SNAPSHOT would cause duplicates. Catch-up on reconnect emits its own MESSAGES_SNAPSHOT from checkpointer state.
+
+#### 4.3.6 core/reconnect.py
+
+**Path:** `src/stream_reconnection_demo/core/reconnect.py`
+
+Common checkpointer-based reconnection handler shared by all agents that use LangGraph's checkpointer for state persistence. Extracts the 3-tier connect pattern that was previously duplicated in `stateful_segment/routes.py` and `template/routes.py`.
+
+**`ReconnectConfig` dataclass:**
+
+```python
+@dataclass
+class ReconnectConfig:
+    node_meta: dict[str, dict]       # node_name → {index, progress, status, title, details}
+    state_snapshot_key: str           # e.g. "template", "segment"
+    emit_catchup: Callable           # async gen: (state, thread_id, run_id, next_nodes) → SSE str
+    get_completed_count: Callable    # (state, next_nodes) → int
+    serialize_snapshot: Callable     # optional: obj → dict (default: identity)
+```
+
+Each agent defines its own `RECONNECT_CONFIG` at module level:
+
+```python
+# template/routes.py
+RECONNECT_CONFIG = ReconnectConfig(
+    node_meta=NODE_META,
+    state_snapshot_key="template",
+    emit_catchup=_emit_synthetic_catchup,
+    get_completed_count=_get_completed_count,
+)
+
+# stateful_segment/routes.py
+RECONNECT_CONFIG = ReconnectConfig(
+    node_meta=NODE_META,
+    state_snapshot_key="segment",
+    emit_catchup=_emit_synthetic_catchup,
+    get_completed_count=_get_completed_count,
+    serialize_snapshot=_serialize_segment,
+)
+```
+
+**`handle_checkpointer_connect()`: The 3-tier pattern**
+
+```python
+async def handle_checkpointer_connect(pubsub, graph, thread_id, run_id, config):
+```
+
+**Tier 1: Active run** — synthetic catch-up from checkpointer + live Pub/Sub:
+
+```python
+active_run_id = await pubsub.get_active_run(thread_id)
+if active_run_id:
+    async def reconnect_stream():
+        async with pubsub.open_subscription(thread_id, active_run_id) as live_events:
+            # Read checkpointer for completed nodes
+            checkpoint_state = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+            completed_count = config.get_completed_count(checkpoint_state.values, next_nodes)
+            catchup_node_index = completed_count - 1
+
+            # Emit synthetic catch-up (agent-specific)
+            async for event in config.emit_catchup(state, thread_id, run_id, next_nodes):
+                yield event
+
+            # Forward live events, skipping nodes already covered by catch-up
+            past_catchup = catchup_node_index < 0
+            async for event_data in live_events:
+                if not past_catchup:
+                    if "STEP_STARTED" in event_data:
+                        step_name = extract_step_name_from_sse(event_data)
+                        if config.node_meta[step_name]["index"] > catchup_node_index:
+                            past_catchup = True
+                    elif "TEXT_MESSAGE_START" in event_data or "RUN_FINISHED" in event_data:
+                        past_catchup = True
+                    if not past_catchup:
+                        continue
+                yield event_data
+```
+
+The deduplication logic compares node indices: live events for nodes with `index <= catchup_node_index` are skipped because they were already covered by synthetic catch-up. This prevents duplicate progress steps and reasoning panels.
+
+**Tier 2: Completed run** — full catch-up from checkpointer:
+
+```python
+if checkpoint_state and checkpoint_state.values:
+    async def completed_stream():
+        async for event in config.emit_catchup(state, thread_id, run_id, next_nodes):
+            yield event
+        yield emitter.emit_run_finished(thread_id, run_id)
+```
+
+**Tier 3: No state** — empty run:
+
+```python
+async def empty_stream():
+    yield emitter.emit_run_started(thread_id, run_id)
+    yield emitter.emit_run_finished(thread_id, run_id)
+```
+
+**`extract_step_name_from_sse()` helper:**
+
+Parses the `stepName` field from a STEP_STARTED SSE event string. Used during Tier 1 deduplication to determine which node a live event belongs to. Previously duplicated in both stateful-segment and template routes.
+
+#### 4.3.7 core/llm.py
+
+**Path:** `src/stream_reconnection_demo/core/llm.py`
+
+Dual-model LLM factory supporting Anthropic (Claude) and Google Vertex AI (Gemini):
+
+```python
+USE_VERTEX_AI = os.getenv("USE_VERTEX_AI", "false").lower() == "true"
+
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_VERTEX_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = DEFAULT_VERTEX_MODEL if USE_VERTEX_AI else DEFAULT_ANTHROPIC_MODEL
+
+def get_llm(model: str = DEFAULT_MODEL) -> BaseChatModel:
+    if USE_VERTEX_AI:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(model=model, vertexai=True)
+    from langchain_anthropic import ChatAnthropic
+    return ChatAnthropic(model=model)
+```
+
+The `USE_VERTEX_AI` environment variable switches the entire backend between providers. Lazy imports (`from langchain_google_genai import ...` inside the function body) avoid requiring the Google SDK when using Anthropic. Used by the analysis and quality subgraphs; the parent `graph.py` still directly instantiates `ChatAnthropic` for the generate/modify nodes.
+
 ### 4.4 Agent: Segment Pipeline
 
 #### 4.4.1 agent/segment/state.py
@@ -1125,54 +1314,116 @@ async def _emit_synthetic_catchup(state, thread_id, run_id) -> AsyncIterator[str
 
 This produces a condensed version of the full event stream -- just enough for the frontend to reconstruct its UI state.
 
-**`_handle_stateful_connect()`: Live + synthetic catch-up**
+**Reconnection via shared `handle_checkpointer_connect()`**
 
-When an active run exists:
-1. Subscribe to the Pub/Sub channel.
-2. Read checkpointer state and emit synthetic catch-up events.
-3. Forward live events from Pub/Sub.
-4. On run completion, read final state from checkpointer for the segment result.
+Previously, this module had its own `_handle_stateful_connect()` (~107 lines) implementing the 3-tier reconnection pattern. This was refactored into the shared `core/reconnect.py` module. The agent provides its specific configuration via `RECONNECT_CONFIG`:
 
-When no active run but checkpointer has state:
-- Emit synthetic catch-up events + `RUN_FINISHED`.
+```python
+def _get_completed_count(state: dict, next_nodes: tuple = ()) -> int:
+    _, completed_count = _reconstruct_progress_from_state(state, next_nodes)
+    return completed_count
+
+def _serialize_segment(segment):
+    if hasattr(segment, "model_dump"):
+        return segment.model_dump()
+    return segment
+
+RECONNECT_CONFIG = ReconnectConfig(
+    node_meta=NODE_META,
+    state_snapshot_key="segment",
+    emit_catchup=_emit_synthetic_catchup,
+    get_completed_count=_get_completed_count,
+    serialize_snapshot=_serialize_segment,
+)
+```
+
+The `serialize_snapshot` callback is needed because the segment state may contain a Pydantic `Segment` object that requires `.model_dump()` before JSON serialization.
+
+Both connect entry points delegate to the shared handler:
+
+```python
+if request_type == "connect":
+    return await handle_checkpointer_connect(
+        pubsub, segment_graph, thread_id, run_id, RECONNECT_CONFIG
+    )
+```
 
 **`_handle_stateful_chat()`: New run with Pub/Sub-only streaming**
 
 1. Checks for duplicate query (same as Strategy 1).
-2. Starts the pipeline via `start_agent_task_pubsub_only()` (no List persistence).
-3. Streams live events via `pubsub.subscribe_and_stream()` (no catch-up, since the client is connected from the start).
+2. If empty query, delegates to `handle_checkpointer_connect()` (handles CopilotKit sending empty messages on reload).
+3. Starts the pipeline via `start_agent_task_pubsub_only()` (no List persistence).
+4. Streams live events via `pubsub.open_subscription()` (subscribe-before-start pattern).
 
 ### 4.6 Agent: Template Builder
 
-The template agent uses the `ag-ui-langgraph` library for automatic AG-UI event generation, replacing the manual event emission pattern used by the segment agents.
+The template agent uses the `ag-ui-langgraph` library for automatic AG-UI event generation. It has a **3-node pipeline** with two subgraph composition approaches, multi-step progress tracking, and rich catch-up on reconnection.
 
 #### 4.6.1 agent/template/state.py
 
 **Path:** `src/stream_reconnection_demo/agent/template/state.py`
 
+Four TypedDicts define state for the parent graph and its two subgraphs:
+
 ```python
+class AnalysisResult(TypedDict):
+    """Result from a single analysis node in the HTML analysis subgraph."""
+    aspect: str          # "subject", "colors", "typography", "structure"
+    findings: str        # LLM analysis output
+    suggestions: list[str]
+    severity: str        # "low", "medium", "high"
+
+class AnalysisSubgraphState(TypedDict):
+    """State for the HTML analysis subgraph (Approach A — native composition)."""
+    template: dict | None
+    analyses: Annotated[list[AnalysisResult], add]  # Fan-in via reducer
+    overall_assessment: str | None
+    needs_improvement: bool
+
+class QualityCheckState(TypedDict):
+    """State for the content quality check subgraph (Approach B — manual ainvoke)."""
+    template: dict | None
+    spelling_report: str | None
+    tone_report: str | None
+    cta_report: str | None
+    quality_summary: str | None
+
 class TemplateAgentState(TypedDict):
-    messages: Annotated[list, add]   # LangChain messages (accumulated via reducer)
-    template: dict | None            # Current template dict (None = first generation)
-    error: str | None                # Error message if generation failed
-    version: int                     # Template version counter
+    messages: Annotated[list, add]
+    template: dict | None
+    error: str | None
+    version: int
+    # Subgraph A fields (native composition shares state):
+    analyses: Annotated[list[AnalysisResult], add]
+    overall_assessment: str | None
+    needs_improvement: bool
+    # Subgraph B fields (mapped manually by wrapper):
+    spelling_report: str | None
+    tone_report: str | None
+    cta_report: str | None
+    quality_summary: str | None
 
 class TemplateOutput(TypedDict):
-    """Output schema — limits STATE_SNAPSHOT to template field only."""
+    """Output schema — limits STATE_SNAPSHOT to these fields only."""
     template: dict | None
+    quality_summary: str | None
 ```
 
-`TemplateOutput` is the graph's output schema. When LangGraph computes `get_state()`, only the `template` field is included. This ensures the library's auto-generated `STATE_SNAPSHOT` events contain `{template: ...}` rather than the full internal state (messages, error, version).
+Key design decisions:
+
+- **`AnalysisSubgraphState.analyses`** uses `Annotated[list[AnalysisResult], add]` — the `add` reducer enables fan-in from the 4 parallel analysis nodes. Each node returns `{"analyses": [result]}` and LangGraph concatenates them.
+- **`TemplateAgentState`** includes fields from both subgraphs. For Approach A (native composition), LangGraph automatically maps `analyses`, `overall_assessment`, and `needs_improvement` between parent and subgraph state. For Approach B, the wrapper node manually maps `spelling_report`, `tone_report`, `cta_report`, and `quality_summary`.
+- **`TemplateOutput`** now includes both `template` and `quality_summary`, so the library's auto-generated `STATE_SNAPSHOT` contains both.
 
 #### 4.6.2 agent/template/graph.py
 
 **Path:** `src/stream_reconnection_demo/agent/template/graph.py`
 
-Two-node graph with conditional routing:
+Three-node pipeline with conditional routing and two subgraph composition approaches:
 
 ```
-START -> _route_by_state() -> generate_template -> END
-                            -> modify_template  -> END
+START → _route_by_state() → generate_template ─┬─→ analyze_template → quality_check → END
+                          → modify_template  ───┘
 ```
 
 **Routing:**
@@ -1184,136 +1435,319 @@ def _route_by_state(state: TemplateAgentState) -> str:
     return "modify_template"
 ```
 
-If no template exists in state, route to generation. Otherwise, route to modification. The `state` dict includes `template` from the `RunAgentInput.state` passed by the routes — which reads from either the frontend state or the checkpointer.
+**Generate/Modify nodes** follow the same pattern as before: extract query from messages, dispatch activity custom events, invoke Claude with structured output (`EmailTemplate`), return the result. The `_assemble_html()` helper builds a full HTML document from sections when the LLM returns structured sections without complete HTML.
 
-**Nodes:**
-
-Both nodes follow the same pattern: extract query from messages, dispatch activity custom events for progress, invoke Claude with structured output, return the result:
-
-```python
-def _build_generate_node(llm: ChatAnthropic):
-    structured_llm = llm.with_structured_output(EmailTemplate)
-
-    async def generate_template(state: TemplateAgentState, config: RunnableConfig) -> dict:
-        query = ""
-        for msg in reversed(state["messages"]):
-            if hasattr(msg, "content"):
-                query = msg.content
-                break
-
-        await adispatch_custom_event("activity_snapshot", {
-            "title": "Generating template", "progress": 0.1,
-            "details": "Starting LLM generation...",
-        }, config=config)
-
-        messages = [SystemMessage(content=GENERATE_SYSTEM_PROMPT), HumanMessage(content=query)]
-        result = await structured_llm.ainvoke(messages, config=config)
-
-        await adispatch_custom_event("activity_snapshot", {
-            "title": "Template generated", "progress": 1.0,
-            "details": f"Created: {result.subject}",
-        }, config=config)
-
-        return {"template": result.model_dump(), "error": None, "version": 1}
-
-    return generate_template
-```
-
-The `modify_template` node is similar but includes the existing template context in the system prompt (subject, sections summary, full HTML) and increments the version counter.
-
-**System prompts:**
-- `GENERATE_SYSTEM_PROMPT`: Instructs Claude to create a professional HTML email template with inline CSS, 600px container, sections (header/body/CTA/footer), and web-safe fonts.
-- `MODIFY_SYSTEM_PROMPT`: Includes the current template context and instructs Claude to apply the user's requested changes while preserving unmentioned sections.
-
-**Custom events:** Each node dispatches `adispatch_custom_event("activity_snapshot", ...)` at 10% and 100% progress. The `EventAdapter` translates these into `ActivitySnapshotEvent` objects. Note: the `config: RunnableConfig` parameter is required for `adispatch_custom_event` — LangGraph auto-injects it when the function signature accepts it.
-
-**Graph compilation:**
+**Subgraph composition:**
 
 ```python
 def build_template_graph(checkpointer=None, model="claude-sonnet-4-20250514"):
     llm = ChatAnthropic(model=model)
     graph = StateGraph(TemplateAgentState, output=TemplateOutput)
+
     graph.add_node("generate_template", _build_generate_node(llm))
     graph.add_node("modify_template", _build_modify_node(llm))
+
+    # Subgraph A: native composition — compiled graph as a node
+    analysis_subgraph = build_analysis_graph(model=model).compile()
+    graph.add_node("analyze_template", analysis_subgraph)
+
+    # Subgraph B: wrapper node using ainvoke internally
+    graph.add_node("quality_check", _build_quality_check_node(model=model))
+
     graph.add_conditional_edges(START, _route_by_state)
-    graph.add_edge("generate_template", END)
-    graph.add_edge("modify_template", END)
+    graph.add_edge("generate_template", "analyze_template")
+    graph.add_edge("modify_template", "analyze_template")
+    graph.add_edge("analyze_template", "quality_check")
+    graph.add_edge("quality_check", END)
+
     return graph.compile(checkpointer=checkpointer)
 ```
 
-The `output=TemplateOutput` parameter limits the graph's output schema, which controls what the library includes in `STATE_SNAPSHOT` events.
+**Approach A vs Approach B:**
 
-#### 4.6.3 agent/template/routes.py
+| Aspect | Approach A (analysis_graph) | Approach B (quality_graph) |
+|--------|---------------------------|--------------------------|
+| Integration | `graph.add_node("analyze_template", compiled_graph)` | `graph.add_node("quality_check", wrapper_function)` |
+| Event visibility | Subgraph nodes appear in parent's `astream_events()` | Subgraph events hidden (internal `ainvoke()`) |
+| State mapping | Automatic via shared field names in parent/child state | Manual — wrapper reads subgraph output and maps to parent fields |
+| Text output | Streamed as TEXT_MESSAGE events (converted to REASONING by EventAdapter) | Not streamed — results stored in state fields, emitted as text in catch-up |
+
+The quality check wrapper node:
+
+```python
+def _build_quality_check_node(model: str):
+    quality_graph = build_quality_graph(model=model).compile()
+
+    async def quality_check_node(state: TemplateAgentState, config: RunnableConfig) -> dict:
+        template = state.get("template")
+        if template is None:
+            return {"quality_summary": "No template to check."}
+        result = await quality_graph.ainvoke({"template": template}, config=config)
+        return {
+            "spelling_report": result.get("spelling_report"),
+            "tone_report": result.get("tone_report"),
+            "cta_report": result.get("cta_report"),
+            "quality_summary": result.get("quality_summary", ""),
+        }
+
+    return quality_check_node
+```
+
+#### 4.6.3 agent/template/analysis_graph.py
+
+**Path:** `src/stream_reconnection_demo/agent/template/analysis_graph.py`
+
+HTML analysis subgraph using fan-out/fan-in pattern (Approach A — native LangGraph composition):
+
+```
+START ──┬── analyze_subject ────┐
+        ├── analyze_colors ─────┤
+        ├── analyze_typography ─┤  fan-out / fan-in
+        ├── analyze_structure ──┘
+        v
+   overall_analysis ──> _route_after_overall() ──> apply_improvements → END
+                                                 → END (if no improvement needed)
+```
+
+**4 parallel analysis nodes** each follow the same pattern:
+
+```python
+def _build_analyze_subject(llm):
+    async def analyze_subject(state: AnalysisSubgraphState, config: RunnableConfig) -> dict:
+        template = state.get("template") or {}
+        prompt = SUBJECT_ANALYSIS_PROMPT.format(
+            subject=template.get("subject", "(no subject)"),
+            preview_text=template.get("preview_text", "(no preview)"),
+        )
+        response = await llm.ainvoke(
+            [SystemMessage(content="You are an email analysis expert. Respond only with valid JSON."),
+             HumanMessage(content=prompt)],
+            config=config,
+        )
+        parsed = _parse_analysis_json(response.content)
+        result: AnalysisResult = {
+            "aspect": "subject",
+            "findings": parsed.get("findings", ""),
+            "suggestions": parsed.get("suggestions", []),
+            "severity": parsed.get("severity", "low"),
+        }
+        return {"analyses": [result]}
+    return analyze_subject
+```
+
+Each returns `{"analyses": [result]}` — the `add` reducer on `AnalysisSubgraphState.analyses` concatenates all 4 results when they fan-in.
+
+**Analysis dimensions:**
+- `analyze_subject`: Subject line length, urgency/curiosity triggers, personalization, spam trigger words
+- `analyze_colors`: Brand consistency, WCAG AA contrast, dark mode compatibility
+- `analyze_typography`: Web-safe fonts, size hierarchy, line height, mobile adequacy
+- `analyze_structure`: Table layout, 600px container, responsiveness, image alt text
+
+**Overall analysis node** synthesizes the 4 individual analyses and determines if improvement is needed:
+
+```python
+# Rules: high severity → needs improvement; 2+ medium → needs improvement
+parsed = _parse_analysis_json(response.content)
+return {
+    "overall_assessment": parsed.get("overall_assessment", ""),
+    "needs_improvement": parsed.get("needs_improvement", False),
+}
+```
+
+**Conditional routing** (`_route_after_overall`): If `needs_improvement` is True, routes to `apply_improvements` which re-invokes Claude with `structured_output(EmailTemplate)` to fix the identified issues. Otherwise, routes to END.
+
+**`_parse_analysis_json()`**: Best-effort JSON parser that handles LLM responses wrapped in markdown code blocks (` ```json ... ``` `). Falls back to wrapping raw text as `{"findings": raw_text, "suggestions": [], "severity": "low"}`.
+
+#### 4.6.4 agent/template/quality_graph.py
+
+**Path:** `src/stream_reconnection_demo/agent/template/quality_graph.py`
+
+Content quality check subgraph using a linear pipeline (Approach B — manual ainvoke):
+
+```
+START → check_spelling → check_tone → check_cta → aggregate_quality → END
+```
+
+**Linear pipeline** — each node depends on the previous node's output:
+
+```python
+def _build_check_tone(llm):
+    async def check_tone(state: QualityCheckState, config: RunnableConfig) -> dict:
+        template = state.get("template") or {}
+        prompt = TONE_PROMPT.format(
+            subject=template.get("subject", "(no subject)"),
+            section_contents=_extract_section_contents(template),
+            spelling_report=state.get("spelling_report", "(not yet available)"),  # depends on prior node
+        )
+        response = await llm.ainvoke(...)
+        return {"tone_report": response.content}
+    return check_tone
+```
+
+The `check_tone` node receives the `spelling_report` from the prior `check_spelling` node, enabling contextual analysis. The `aggregate_quality` node receives all three reports and produces a concise overall summary.
+
+**`_extract_section_contents()`**: Converts template sections to readable text for LLM analysis — formats each section as `[type] content`.
+
+Since this subgraph is invoked via `ainvoke()` inside the wrapper node (Approach B), its internal events do NOT appear in the parent's `astream_events()`. The quality reports (`spelling_report`, `tone_report`, `cta_report`, `quality_summary`) are stored in the parent graph's state via the wrapper node's return dict and are available for catch-up on reconnection.
+
+#### 4.6.5 agent/template/routes.py
 
 **Path:** `src/stream_reconnection_demo/agent/template/routes.py`
 
-Defines `POST /api/v1/template` and `GET /api/v1/template/state/{thread_id}`. Uses the same request/response patterns as the segment routes but with `EventAdapter` + `LangGraphAgent` instead of manual event emission.
+Defines `POST /api/v1/template` and `GET /api/v1/template/state/{thread_id}`. Uses `EventAdapter` + `LangGraphAgent` for live streaming and the shared `handle_checkpointer_connect()` for reconnection.
+
+**Node metadata for progress tracking:**
+
+```python
+NODE_META = {
+    "generate_template": {"index": 0, "progress": 0.15, "status": "generating", ...},
+    "modify_template":   {"index": 0, "progress": 0.15, "status": "modifying", ...},
+    "analyze_template":  {"index": 1, "progress": 0.50, "status": "analyzing", ...},
+    "quality_check":     {"index": 2, "progress": 0.85, "status": "checking", ...},
+}
+TOTAL_NODES = 3
+```
+
+Note: `generate_template` and `modify_template` share index 0 because they are conditional alternatives (only one runs per execution).
+
+**Two execution paths:**
+
+```python
+NODE_ORDER_GENERATE = ["generate_template", "analyze_template", "quality_check"]
+NODE_ORDER_MODIFY = ["modify_template", "analyze_template", "quality_check"]
+```
 
 **`handle_template()`: Request dispatcher**
 
 ```python
 @router.post("/template")
 async def handle_template(request: Request):
-    body = await request.json()
-    thread_id = get_field(body, "thread_id", "threadId", str(uuid.uuid4()))
-    run_id = get_field(body, "run_id", "runId", str(uuid.uuid4()))
-    query = extract_user_query(body.get("messages", []))
-    metadata = body.get("metadata", {})
-    request_type = metadata.get("requestType", "chat")
-
+    ...
     if request_type == "connect":
-        return await _handle_connect(pubsub, template_graph, thread_id, run_id)
-    return await _handle_chat(pubsub, template_graph, template_agent, thread_id, run_id, query, frontend_state)
+        return await handle_checkpointer_connect(
+            pubsub, template_graph, thread_id, run_id, RECONNECT_CONFIG
+        )
+    return await _handle_chat(pubsub, template_graph, template_agent, ...)
 ```
 
 **`_handle_chat()`: New run via LangGraphAgent + EventAdapter**
 
 1. Duplicate query detection via checkpointer (same pattern as segment).
 2. If duplicate: return minimal run (`RUN_STARTED` + `STATE_SNAPSHOT` with template + `RUN_FINISHED`).
-3. Build `RunAgentInput` with the user message and existing template state (from frontend or checkpointer).
-4. Create `EventAdapter().stream_events(template_agent, input_data)` — yields SSE strings.
-5. Pass to `start_agent_task_pubsub_only()` — publishes each SSE string to Redis Pub/Sub.
-6. Return `StreamingResponse` with `pubsub.subscribe_and_stream()`.
+3. Build `RunAgentInput` with the user message, existing template state, and `forwarded_props={"stream_subgraphs": True}`.
+4. Create `EventAdapter().stream_events()` with subgraph-aware configuration:
 
 ```python
-input_data = RunAgentInput(
-    thread_id=thread_id, run_id=run_id,
-    messages=[UserMessage(id=str(uuid.uuid4()), role="user", content=query)],
-    state={"template": existing_template, "version": ...},
-    tools=[], context=[], forwarded_props={},
-)
-
 adapter = EventAdapter()
-event_stream = adapter.stream_events(template_agent, input_data, state_snapshot_key="template")
-start_agent_task_pubsub_only(pubsub, template_graph, thread_id, run_id, event_stream)
+event_stream = adapter.stream_events(
+    template_agent, input_data,
+    state_snapshot_key="template",
+    allowed_step_names=set(NODE_META.keys()),     # Only parent-level nodes
+    reasoning_step_names={"analyze_template"},     # Convert analysis text to reasoning
+)
 ```
 
-The `RunAgentInput.state` field passes the existing template to the graph, which enables the `_route_by_state()` conditional to correctly choose between generate and modify.
-
-**`_handle_connect()`: Catch-up from checkpointer**
-
-Same pattern as `_handle_stateful_connect` in the stateful segment routes:
-
-1. **Active run found**: Subscribe to Pub/Sub first (buffer), read checkpointer state, emit synthetic catch-up events (`RUN_STARTED` + `MESSAGES_SNAPSHOT` + `STATE_SNAPSHOT`), yield live Pub/Sub events. On stream end, read final state from checkpointer for the template result.
-2. **Completed run (no active)**: Emit synthetic catch-up from checkpointer + `RUN_FINISHED`.
-3. **Nothing found**: Empty run (`RUN_STARTED` + `RUN_FINISHED`).
-
-**`_emit_synthetic_catchup()`: Reconstruct events from checkpointer state**
+5. Subscribe to Pub/Sub BEFORE starting the background task (prevents missed events):
 
 ```python
-async def _emit_synthetic_catchup(state, thread_id, run_id):
+async def live_stream():
+    async with pubsub.open_subscription(thread_id, run_id) as events:
+        start_agent_task_pubsub_only(pubsub, template_graph, thread_id, run_id, event_stream)
+        async for event in events:
+            yield event
+```
+
+**`forwarded_props={"stream_subgraphs": True}`**: Tells `LangGraphAgent` to include subgraph events in the `astream_events()` output. Without this, the analysis subgraph's nodes would be invisible.
+
+**Reconnection via `ReconnectConfig`:**
+
+```python
+def _get_completed_count(state: dict, next_nodes: tuple = ()) -> int:
+    _, completed_count, _ = _reconstruct_progress_from_state(state, next_nodes)
+    return completed_count
+
+RECONNECT_CONFIG = ReconnectConfig(
+    node_meta=NODE_META,
+    state_snapshot_key="template",
+    emit_catchup=_emit_synthetic_catchup,
+    get_completed_count=_get_completed_count,
+)
+```
+
+**`_reconstruct_progress_from_state()`: Determine progress from checkpointer**
+
+```python
+def _reconstruct_progress_from_state(state, next_nodes=()):
+    node_order = _determine_node_order(state, next_nodes)  # generate vs modify path
+
+    if next_nodes:  # Prefer checkpoint metadata
+        next_node = next_nodes[0]
+        idx = node_order.index(next_node)
+        if idx > 0:
+            return node_order[idx - 1], idx, node_order
+
+    # Fallback: inspect state fields
+    NODE_STATE_FIELDS = {
+        "generate_template": "template",
+        "modify_template": "template",
+        "analyze_template": "overall_assessment",
+        "quality_check": "quality_summary",
+    }
+    for node_name in node_order:
+        field = NODE_STATE_FIELDS[node_name]
+        if state.get(field) is not None:
+            completed_count += 1
+        else:
+            break
+    return last_completed, completed_count, node_order
+```
+
+**`_emit_synthetic_catchup()`: Rich catch-up from checkpointer**
+
+Unlike the previous single-step version, this now reconstructs per-node progress, analysis reasoning, and quality reports:
+
+```python
+async def _emit_synthetic_catchup(state, thread_id, run_id, next_nodes=()):
     yield emitter.emit_run_started(thread_id, run_id)
+
+    # Restore chat history
     messages = state.get("messages", [])
     if messages:
         agui_msgs = emitter.langchain_messages_to_agui(messages)
-        if agui_msgs:
-            yield emitter.emit_messages_snapshot(agui_msgs)
+        yield emitter.emit_messages_snapshot(agui_msgs)
+
+    # Emit synthetic progress for each completed node
+    _, completed_count, node_order = _reconstruct_progress_from_state(state, next_nodes)
+    for i in range(completed_count):
+        node_name = node_order[i]
+        meta = NODE_META[node_name]
+        yield emitter.emit_step_start(node_name)
+        yield emitter.emit_tool_call_start/args/end(...)  # progress status
+        yield emitter.emit_activity_snapshot(...)
+
+        # Restore analysis content as reasoning panels
+        if node_name == "analyze_template":
+            for event in _emit_analysis_reasoning(state):
+                yield event
+        elif node_name == "quality_check":
+            for event in _emit_quality_text(state):
+                yield event
+
+        yield emitter.emit_step_finish(node_name)
+
+    # Emit template state snapshot
     template = state.get("template")
     if template:
         yield emitter.emit_state_snapshot(template)
+
+    # Emit completed progress status
+    if completed_count == TOTAL_NODES:
+        yield emitter.emit_tool_call_start/args/end(status="completed", ...)
 ```
 
-Simpler than the segment's `_emit_synthetic_catchup` — no progress stepper reconstruction needed since the template agent is a single-step LLM call.
+**`_emit_analysis_reasoning()`**: Formats each `AnalysisResult` from the `analyses` state field as readable paragraphs (aspect, severity, findings, suggestions) wrapped in REASONING events. Includes the overall assessment with needs_improvement flag.
+
+**`_emit_quality_text()`**: Emits `spelling_report`, `tone_report`, `cta_report`, and `quality_summary` as individual text messages in the sidebar.
 
 **State endpoint:**
 
@@ -2076,9 +2510,9 @@ Identical to `segment/page.tsx` except:
 
 #### 6.2.5 app/template/page.tsx
 
-**Path:** `frontend-next/app/template/page.tsx`
+**Path:** `frontend-next/app/template/page.tsx` (225 lines)
 
-The template builder page. Structure:
+The template builder page. Structure mirrors the segment page with progress tracking, reasoning panels, and activity indicators:
 
 ```
 TemplatePage (Suspense wrapper)
@@ -2087,46 +2521,64 @@ TemplatePage (Suspense wrapper)
           -> CopilotSidebar (defaultOpen=true, RenderMessage=CustomRenderMessage)
               -> TemplatePageContent
                   - useCoAgent<EmailTemplate>({ name: "default" }) -> template state
-                  - useCoAgentStateRender -> inline "Template updated" notification
-                  - Content: Nav + TemplateEditor (when template.subject exists) or placeholder
+                  - useCopilotAction("update_progress_status") -> progress bar
+                  - useState: progressStatus, isModifyPath
+                  - Content: Nav + ProgressStatus + TemplateEditor (or placeholder)
 ```
+
+The page defines node labels and order for the stepper UI:
 
 ```tsx
-function TemplatePageContent() {
-  useCoAgentStateRender({
-    name: "default",
-    render: ({ state }) =>
-      state?.subject ? (
-        <div className="... bg-green-50 ...">Template updated: {state.subject}</div>
-      ) : null,
-  });
+const TEMPLATE_NODE_LABELS: Record<string, string> = {
+  generate_template: "Generate",
+  modify_template: "Modify",
+  analyze_template: "Analyze",
+  quality_check: "Quality",
+};
 
-  const { state: template, setState: setTemplate } = useCoAgent<EmailTemplate>({ name: "default" });
-
-  return (
-    <div className="h-screen flex flex-col">
-      <Nav />
-      <main className="flex-1 overflow-hidden">
-        {template?.subject ? (
-          <TemplateEditor template={template} onHtmlChange={(html) => setTemplate({ ...template, html })} />
-        ) : (
-          <div className="flex items-center justify-center h-full">
-            <p>Describe your email template in the sidebar to get started.</p>
-          </div>
-        )}
-      </main>
-    </div>
-  );
-}
+const TEMPLATE_NODE_ORDER = ["generate_template", "analyze_template", "quality_check"];
 ```
+
+`TemplatePageContent` uses the same `useCopilotAction("update_progress_status")` pattern as the segment page:
+
+```tsx
+useCopilotAction({
+  name: "update_progress_status",
+  parameters: [
+    { name: "status", type: "string", description: "Current status" },
+    { name: "node", type: "string", description: "Current node name" },
+    { name: "node_index", type: "number", description: "Current node index" },
+    { name: "total_nodes", type: "number", description: "Total number of nodes" },
+  ],
+  handler: ({ status, node, node_index, total_nodes }) => {
+    if (status === "starting") {
+      setProgressStatus(null);
+      setIsModifyPath(false);
+      return;
+    }
+    if (node === "modify_template") setIsModifyPath(true);
+    setProgressStatus({ status, node, nodeIndex: node_index, totalNodes: total_nodes });
+  },
+});
+```
+
+The page dynamically adjusts `nodeOrder` based on whether the pipeline is generating (first request) or modifying (subsequent requests):
+
+```tsx
+const nodeOrder = isModifyPath
+  ? ["modify_template", "analyze_template", "quality_check"]
+  : TEMPLATE_NODE_ORDER;
+```
+
+This drives the `ProgressStatus` stepper to show "Generate -> Analyze -> Quality" or "Modify -> Analyze -> Quality" accordingly.
+
+**CustomRenderMessage:** Same pattern as the segment page — filters old reasoning/activity messages from previous turns, renders `ReasoningPanel` for reasoning messages (from the analysis subgraph), `ActivityIndicator` for activity messages, and standard `UserMessage`/`AssistantMessage` components.
 
 Key differences from segment page:
 - Uses `useCoAgent<EmailTemplate>` instead of `useCoAgent<Segment>`
-- No `useCopilotAction("update_progress_status")` — the template agent doesn't emit progress tool calls
-- `useCoAgentStateRender` renders an inline notification when the template is updated (vs. `render: () => null` in segment)
-- Content area shows `TemplateEditor` with live HTML preview instead of `SegmentCard` with conditions
-
-**CustomRenderMessage:** Same pattern as segment page — filters old reasoning/activity messages, renders user/assistant messages. Slightly simpler since there's no `InlineSegmentCard`.
+- Tracks `isModifyPath` to switch between generate/modify node orders
+- No `useCoAgentStateRender` callback (no inline state card) — template renders via `TemplateEditor` in the main content area
+- Content area shows `ProgressStatus` + `TemplateEditor` with iframe preview instead of `SegmentCard`
 
 ### 6.3 API Routes (CopilotRuntime Proxy)
 
@@ -2523,7 +2975,7 @@ The `STATE_SNAPSHOT` event in the duplicate response is critical. Without it, th
 
 ### 7.4 Template Agent Lifecycle
 
-The template agent follows the same high-level flow but with automated event generation:
+The template agent follows the same high-level flow but with automated event generation and a 3-node pipeline:
 
 **New Template (Chat Flow):**
 
@@ -2542,8 +2994,9 @@ Browser                          CopilotKit Runtime                    FastAPI B
   |                                    |                           2. pubsub.start_run()
   |                                    |                           3. Build RunAgentInput
   |                                    |                              (state.template = null → generate)
+  |                                    |                              (forwarded_props.stream_subgraphs = true)
   |                                    |                           4. EventAdapter.stream_events()
-  |                                    |                              → LangGraphAgent.run()
+  |                                    |                              (allowed_step_names, reasoning_step_names)
   |                                    |                           5. start_agent_task_pubsub_only()
   |                                    |                                    |
   |                                    |              Background task:      |
@@ -2552,73 +3005,77 @@ Browser                          CopilotKit Runtime                    FastAPI B
   |                                    |              _route_by_state()     |
   |                                    |              → generate_template   |
   |                                    |                 |                  |
-  |                                    |              Library auto-emits:   |
-  |                                    |              - RUN_STARTED         |
-  |                                    |              - STEP_STARTED        |
+  |                                    |              STEP_STARTED(generate_template)
+  |                                    |              EventAdapter: inject STATE_SNAPSHOT {}
+  |                                    |              Claude structured output → template
+  |                                    |              STEP_FINISHED(generate_template)
   |                                    |                 |                  |
-  |                                    |              EventAdapter:         |
-  |                                    |              - Injects STATE_SNAPSHOT {} |
-  |                                    |              - Translates activity |
-  |                                    |                custom events      |
-  |                                    |              - Filters null       |
-  |                                    |                STATE_SNAPSHOT     |
+  |  ProgressStatus: "Generate 1/3"   |                 v                  |
+  |                                    |              STEP_STARTED(analyze_template)
+  |                                    |              → Analysis subgraph (Approach A):
+  |                                    |                4 parallel LLM calls (fan-out)
+  |                                    |                → analyze_subject, colors, typo, structure
+  |                                    |                → overall_analysis (fan-in)
+  |                                    |                → [apply_improvements if needed]
+  |                                    |              EventAdapter: subgraph TEXT → REASONING
+  |                                    |              STEP_FINISHED(analyze_template)
   |                                    |                 |                  |
-  |                                    |              Claude LLM call      |
-  |                                    |              (structured output)  |
+  |  ProgressStatus: "Analyze 2/3"    |                 v                  |
+  |  ReasoningPanel: "Chain of        |              STEP_STARTED(quality_check)
+  |    Thought" (analysis results)    |              → Quality subgraph (Approach B):
+  |                                    |                ainvoke() — events hidden
+  |                                    |                spelling → tone → cta → summary
+  |                                    |              Quality reports as TEXT_MESSAGE_*
+  |                                    |              STEP_FINISHED(quality_check)
   |                                    |                 |                  |
-  |                                    |              Library auto-emits:   |
-  |                                    |              - TEXT_MESSAGE_*      |
-  |                                    |              - STATE_SNAPSHOT      |
-  |                                    |                {template: {...}}  |
-  |                                    |              - STEP_FINISHED       |
-  |                                    |              - RUN_FINISHED        |
+  |  ProgressStatus: "Quality 3/3"    |              STATE_SNAPSHOT {template}
+  |  Quality reports in sidebar       |              RUN_FINISHED
   |                                    |                                    |
-  |<── SSE: events via Pub/Sub ────────|<── Pub/Sub: events ───────────────|
-  |                                    |                                    |
-  |  useCoAgent receives               |                                    |
-  |    STATE_SNAPSHOT with template    |                                    |
-  |  TemplateEditor renders            |                                    |
+  |  TemplateEditor renders           |<── SSE: events via Pub/Sub ────────|
   |  (subject, preview, HTML iframe)   |                                    |
 ```
 
-**Modify Template (subsequent query):**
+**Reconnection after completion (reload):**
 
 ```
-  |── User types: "Change the CTA     |                                    |
-  |   button to blue" ───────────>    |                                    |
-  |                                    |── POST /api/v1/template ─────────>|
+Browser                          CopilotKit Runtime                    FastAPI Backend
+──────                           ──────────────────                    ──────────────
+  |── Page reload ──────────────>     |                                    |
+  |                                    |── POST (requestType: "connect") ──>|
   |                                    |                                    |
-  |                                    |                           _handle_chat():
-  |                                    |                           1. Check duplicate → no match
-  |                                    |                           2. Build RunAgentInput
-  |                                    |                              (state.template = existing → modify)
+  |                                    |              handle_checkpointer_connect():
+  |                                    |              Tier 2: completed run
+  |                                    |              _emit_synthetic_catchup():
+  |                                    |                - MESSAGES_SNAPSHOT (user messages)
+  |                                    |                - For each completed node:
+  |                                    |                  STEP_START → TOOL_CALL(progress)
+  |                                    |                  → ACTIVITY_SNAPSHOT
+  |                                    |                  → [REASONING events for analyze]
+  |                                    |                  → [TEXT messages for quality]
+  |                                    |                  → STEP_FINISH
+  |                                    |                - STATE_SNAPSHOT (template)
+  |                                    |                - TOOL_CALL(status=completed)
+  |                                    |              RUN_FINISHED
   |                                    |                                    |
-  |                                    |              _route_by_state()     |
-  |                                    |              → modify_template     |
-  |                                    |                 |                  |
-  |                                    |              System prompt includes|
-  |                                    |              existing template     |
-  |                                    |              context (subject,     |
-  |                                    |              sections, HTML)       |
-  |                                    |                 |                  |
-  |                                    |              Claude modifies,      |
-  |                                    |              version increments    |
-  |                                    |                                    |
-  |  TemplateEditor re-renders         |<── STATE_SNAPSHOT {version: 2} ───|
-  |  with updated template             |                                    |
+  |  Full UI restored:                 |<── SSE: synthetic catch-up ────────|
+  |  - Progress bar: 3/3 complete     |                                    |
+  |  - Chain of Thought panel         |                                    |
+  |  - Quality reports in sidebar     |                                    |
+  |  - Template preview in editor     |                                    |
 ```
 
 **Key differences from segment lifecycle:**
-- **No 8-step stepper**: Template agent is a single-step LLM call, not a multi-node pipeline
-- **No reasoning panels**: The library auto-generates reasoning events from the LLM stream, but the template page uses the same filtering as segment (only shows the latest during processing)
-- **Conditional routing**: Generate vs. modify is determined by the presence of existing template state
-- **EventAdapter**: Sits between `LangGraphAgent.run()` and the Redis pipeline, translating custom events and filtering intermediate snapshots
+- **3-node pipeline with subgraphs**: generate/modify → analyze (4 parallel LLM calls) → quality (4 sequential checks)
+- **Two subgraph approaches**: Native composition (analysis — events visible) vs manual ainvoke (quality — events hidden)
+- **EventAdapter-mediated**: Subgraph text converted to reasoning panels, step filtering, snapshot extraction
+- **Shared reconnection handler**: Uses `handle_checkpointer_connect()` from `core/reconnect.py` with agent-specific `RECONNECT_CONFIG`
+- **Rich catch-up**: Reconstructs progress, analysis reasoning, quality reports, and template state from checkpointer
 
 ---
 
 ## 8. Segment vs Template Agent: Feature Comparison
 
-This section compares the **segment agent** (manual AG-UI event emission, no `ag-ui-langgraph`) with the **template agent** (uses `ag-ui-langgraph` via `LangGraphAgent` + `EventAdapter`). It catalogs missing functionality, workarounds required, and additional capabilities gained by adopting the library.
+This section compares the **segment agent** (manual AG-UI event emission, no `ag-ui-langgraph`) with the **template agent** (uses `ag-ui-langgraph` via `LangGraphAgent` + `EventAdapter`). With the addition of subgraphs and the `EventAdapter` enhancements, many of the previous feature gaps have been closed.
 
 ### 8.1 Summary Table
 
@@ -2626,248 +3083,130 @@ This section compares the **segment agent** (manual AG-UI event emission, no `ag
 |---|---|---|---|
 | **Run lifecycle** (RUN_STARTED / RUN_FINISHED / RUN_ERROR) | Manual `emit_run_started()` etc. | Auto from `LangGraphAgent._handle_stream_events()` | Library handles all three automatically |
 | **Text message streaming** | Manual `emit_text_start/content/end()` | Auto from `on_chat_model_stream` events | Library listens to `astream_events()` tokens |
-| **State snapshots** | Manual `emit_state_snapshot(segment.model_dump())` | Auto final STATE_SNAPSHOT at stream end; EventAdapter filters intermediates | Library emits snapshot of full graph state; EventAdapter extracts domain key |
+| **State snapshots** | Manual `emit_state_snapshot(segment.model_dump())` | Auto final STATE_SNAPSHOT at stream end; EventAdapter filters intermediates and extracts domain key | Library emits snapshot of full graph state; EventAdapter extracts `state_snapshot_key` |
 | **State deltas** (JSON Patch) | Manual `emit_state_delta(ops)` with `_DELTA_FIELDS` list | Not used (no incremental state updates emitted) | Library supports it via `ManuallyEmitState` custom event, but template agent doesn't use it |
-| **Step tracking** | Manual `emit_step_start/finish()` per node | Not emitted | Library has no step concept; would need custom events |
-| **Tool call progress** | Manual `emit_tool_call_start/args/end("update_progress_status")` | Not emitted | Segment uses fake tool calls to drive `useCopilotAction` on frontend |
-| **Activity indicators** | Manual `emit_activity_snapshot()` | `adispatch_custom_event("activity_snapshot")` → EventAdapter translates to `ActivitySnapshotEvent` | Works, but requires EventAdapter translation layer |
-| **Reasoning panels** | Manual `emit_reasoning_start/content/end()` with `asyncio.sleep(0.05)` delays | Auto from LLM if extended thinking enabled; no manual emission possible | Library auto-detects `on_chat_model_stream` reasoning tokens; no `ManuallyEmitReasoning` custom event exists |
-| **Messages snapshot** | Manual `emit_messages_snapshot()` with `langchain_messages_to_agui()` | Auto MESSAGES_SNAPSHOT at stream end | Library handles conversion and emission |
-| **Reconnection** | Redis List + Pub/Sub (full replay) | Checkpointer-only (synthetic catch-up via `_emit_synthetic_catchup()`) | Different strategies; both work |
-| **Progress bar** (multi-step) | `useCopilotAction("update_progress_status")` with node/index/total | Not available | Template is single-step, but even if multi-step, no mechanism to drive it |
-| **Inline state render** | `useCoAgentStateRender` → `SegmentCard` inline after assistant message | `useCoAgentStateRender` → green banner; `useCoAgent` → `TemplateEditor` | Both use the same CopilotKit hooks |
+| **Step tracking** | Manual `emit_step_start/finish()` per node | Auto STEP_STARTED/FINISHED from library, filtered by `allowed_step_names` in EventAdapter | EventAdapter only passes parent-level steps, drops subgraph-internal steps |
+| **Tool call progress** | Manual `emit_tool_call_start/args/end("update_progress_status")` | Manual in catch-up `_emit_synthetic_catchup()`; not emitted during live streaming | Segment uses fake tool calls live; template uses them only in catch-up for progress bar reconstruction |
+| **Activity indicators** | Manual `emit_activity_snapshot()` | `adispatch_custom_event("activity_snapshot")` → EventAdapter translates to `ActivitySnapshotEvent` | Works via EventAdapter translation layer |
+| **Reasoning panels** | Manual `emit_reasoning_start/content/end()` with `asyncio.sleep(0.05)` delays | EventAdapter converts analysis subgraph TEXT events to REASONING events | Segment: simulated from NODE_META; Template: real LLM output from native subgraph |
+| **Messages snapshot** | Manual `emit_messages_snapshot()` with `langchain_messages_to_agui()` | Auto MESSAGES_SNAPSHOT suppressed by EventAdapter; manual in catch-up | Suppressed during live to prevent duplicates; emitted from checkpointer during catch-up |
+| **Reconnection** | Redis List + Pub/Sub (full replay) | Checkpointer-only via shared `handle_checkpointer_connect()` | Segment: full event replay; Template/Stateful: synthetic catch-up from state |
+| **Progress bar** (multi-step) | `useCopilotAction("update_progress_status")` with node/index/total | Same pattern — `useCopilotAction("update_progress_status")` with 3-node pipeline | Both now have multi-step progress tracking |
+| **Multi-node pipeline** | 8 nodes, linear | 3 parent nodes (conditional first node + 2 subgraphs containing ~10 internal nodes) | Template has richer per-node processing via subgraphs |
+| **Inline state render** | `useCoAgentStateRender` → `SegmentCard` inline after assistant message | `useCoAgent` → `TemplateEditor` with iframe preview | Both use CopilotKit hooks |
 | **Duplicate query prevention** | Checkpointer message comparison | Checkpointer message comparison | Identical implementation |
 | **Error handling** | `emit_run_error()` in routes | Auto RUN_FINISHED with error; `EventAdapter` passes through | Library handles error finalization |
 | **Concurrent request safety** | Each request gets its own pipeline generator | **Bug**: `template_agent` on `app.state` shared without `clone()` | Library requires `agent.clone()` per request |
 
-### 8.2 What the Template Agent Is Missing
+### 8.2 Feature Gaps Closed by Subgraph Architecture
 
-#### 8.2.1 Multi-Step Progress Tracking
+With the addition of the analysis and quality subgraphs, several gaps that existed in the original single-step template agent have been addressed:
 
-The segment agent provides granular progress via two mechanisms:
+#### 8.2.1 Multi-Step Progress Tracking — Now Available
 
-**1. Tool-call-based progress (`useCopilotAction`)**
-
-The segment agent emits fake tool calls that the frontend intercepts:
+The template agent now has a 3-node pipeline with progress tracking via `NODE_META` and `useCopilotAction("update_progress_status")`:
 
 ```python
-# segment/routes.py — emits a tool call the frontend handles as a progress update
-yield emitter.emit_tool_call_start(
-    tool_call_id=f"progress-{node_name}",
-    tool_name="update_progress_status",
-    parent_message_id=msg_id,
-)
-yield emitter.emit_tool_call_args(
-    tool_call_id=f"progress-{node_name}",
-    delta=json.dumps({
-        "status": "processing",
-        "node": node_name,
-        "node_index": idx,
-        "total_nodes": 8,
-    }),
-)
-yield emitter.emit_tool_call_end(tool_call_id=f"progress-{node_name}")
-```
-
-The frontend catches this with `useCopilotAction("update_progress_status")` and renders a `<ProgressStatus>` component showing "Step 3/8 — Validating fields...".
-
-The template agent has **no equivalent**. The library's `LangGraphAgent` does not emit step events or tool-call events for non-tool nodes. There is no mechanism to inject fake tool calls through the library — `CustomEventNames` only supports `ManuallyEmitMessage`, `ManuallyEmitToolCall`, `ManuallyEmitState`, and `Exit`.
-
-**2. Step events**
-
-```python
-# segment/routes.py
-yield emitter.emit_step_start(step_id)
-# ... node processing ...
-yield emitter.emit_step_finish(step_id)
-```
-
-The library has no concept of "steps." Step events (`STEP_STARTED`, `STEP_FINISHED`) are not emitted by `LangGraphAgent`.
-
-#### 8.2.2 Reasoning Panels (Simulated)
-
-The segment agent emits hand-crafted reasoning content from `NODE_META`:
-
-```python
-# segment/routes.py — simulated reasoning with streaming delays
-yield emitter.emit_reasoning_start()
-yield emitter.emit_reasoning_message_start(msg_id)
-for line in meta["reasoning"]:          # pre-written reasoning steps
-    yield emitter.emit_reasoning_content(line + "\n")
-    await asyncio.sleep(0.05)           # typewriter effect
-yield emitter.emit_reasoning_message_end()
-yield emitter.emit_reasoning_end()
-```
-
-The `NODE_META` dictionary (lines 18-115 of `segment/routes.py`) defines step-by-step reasoning strings per node, e.g.:
-
-```python
-"analyze_requirements": {
-    "reasoning": [
-        "Breaking down user request into components...",
-        "Identifying key audience attributes mentioned...",
-        "Mapping natural language to available field types...",
-    ],
-    ...
+NODE_META = {
+    "generate_template": {"index": 0, "progress": 0.15, ...},
+    "analyze_template":  {"index": 1, "progress": 0.50, ...},
+    "quality_check":     {"index": 2, "progress": 0.85, ...},
 }
 ```
 
-The template agent **cannot emit fake reasoning**. The library auto-detects reasoning from LLM stream events (`on_chat_model_stream`) when extended thinking is enabled on the model. But:
-- There is no `ManuallyEmitReasoning` in `CustomEventNames`
-- `adispatch_custom_event` with a reasoning-related name would land as a `CUSTOM` event, not a `REASONING` event
-- The EventAdapter only translates `"activity_snapshot"` and `"state_delta"` custom events
+During live streaming, the library auto-emits `STEP_STARTED`/`STEP_FINISHED` for each parent node. The EventAdapter filters these to only include `allowed_step_names` (parent-level nodes). Progress status is driven by `update_progress_status` tool calls during synthetic catch-up.
 
-Real LLM reasoning would work (enable `extended_thinking` on `ChatAnthropic`), but the segment agent's handcrafted, deterministic reasoning UX is not replicable through the library.
+The frontend `ProgressStatus` component renders "Generate 1/3 → Analyze 2/3 → Quality 3/3" with a stepper UI, matching the segment agent's pattern.
 
-#### 8.2.3 Incremental State Deltas
+#### 8.2.2 Reasoning Panels — Now Available (Real LLM Output)
 
-The segment agent emits JSON Patch operations as each node completes:
+The EventAdapter converts analysis subgraph TEXT_MESSAGE events to REASONING events:
 
 ```python
-# segment/routes.py
-_DELTA_FIELDS = [
-    "requirements", "entities", "validated_fields",
-    "operator_mappings", "conditions_draft",
-    "optimized_conditions", "scope_estimate",
-]
-
-# After each node, emit deltas for new fields
-for field in _DELTA_FIELDS:
-    if field in node_output:
-        ops = [{"op": "replace", "path": f"/{field}", "value": node_output[field]}]
-        yield emitter.emit_state_delta(ops)
+reasoning_step_names={"analyze_template"}
 ```
 
-The frontend receives these as `STATE_DELTA` events and incrementally updates `useCoAgent` state.
+When the analysis subgraph's nodes (which are native LangGraph subgraph nodes via Approach A) stream their LLM responses, the library emits TEXT_MESSAGE events. The EventAdapter intercepts these and wraps them in a single consolidated REASONING panel:
 
-The template agent does **not emit state deltas**. It only emits a single `STATE_SNAPSHOT` at the end of the run (after `_assemble_html()` completes). The library supports `ManuallyEmitState` custom events, but the template agent's graph nodes don't use them. The result: the frontend sees nothing until the entire LLM call finishes — no partial template preview during generation.
-
-#### 8.2.4 Redis List Persistence for Full Event Replay
-
-The segment agent persists every SSE event to a Redis List:
-
-```python
-# pubsub.py
-async def publish_event(self, thread_id, run_id, event_data):
-    key = self.events_key(thread_id, run_id)
-    seq = await self._redis.rpush(key, event_data)   # persist
-    await self._redis.expire(key, self._ttl)
-    await self._redis.publish(channel, envelope)       # fan-out
-    return seq
+```
+REASONING_START → REASONING_MESSAGE_START
+  → REASONING_CONTENT (subject analysis)
+  → "---" separator
+  → REASONING_CONTENT (color analysis)
+  → "---" separator
+  → REASONING_CONTENT (typography analysis)
+  → "---" separator
+  → REASONING_CONTENT (structure analysis)
+  → "---" separator
+  → REASONING_CONTENT (overall assessment)
+→ REASONING_MESSAGE_END → REASONING_END
 ```
 
-On reconnection, it replays the full event stream from the List (`LRANGE 0 -1`), giving the frontend an identical experience to the original — including activity indicators, reasoning panels, progress steps, and partial deltas.
+Unlike the segment agent's simulated reasoning (hardcoded strings from NODE_META with `asyncio.sleep` delays), the template agent shows **real LLM analysis output** in the reasoning panel.
 
-The template agent uses **Pub/Sub only** (`start_agent_task_pubsub_only`). Reconnection reconstructs state synthetically from the checkpointer:
+#### 8.2.3 Incremental State Deltas — Still Not Used
 
-```python
-# template/routes.py — _emit_synthetic_catchup()
-yield emitter.emit_run_started(run_id)
-yield emitter.emit_messages_snapshot(messages, thread_id)
-if template_data:
-    yield emitter.emit_state_snapshot(template_data)
-```
+The template agent does not emit state deltas. The frontend sees the template only via `STATE_SNAPSHOT` at the end of the generate/modify node. This remains a gap — no partial template preview during generation.
 
-This means reconnection only restores the **final state**, not the journey. No activity indicators, no progress, no reasoning — just the end result. For the template agent this is acceptable (single LLM call, few seconds), but it would be inadequate for a multi-step pipeline.
+#### 8.2.4 Redis List Persistence — Intentionally Omitted
+
+Both checkpointer-based agents (stateful-segment and template) use Pub/Sub-only streaming. Reconnection reconstructs state synthetically from the checkpointer. This provides rich catch-up (progress, analysis reasoning, quality reports, template state) but does not replay the exact event stream. Mid-stream text loss remains the known tradeoff.
 
 ### 8.3 Workarounds Required with ag-ui-langgraph
 
-#### 8.3.1 EventAdapter (112 lines)
+#### 8.3.1 EventAdapter (214 lines)
 
-The library's `LangGraphAgent.run()` yields AG-UI event objects, but they don't match what the existing infrastructure expects:
+The EventAdapter has grown from 112 to ~214 lines to handle subgraph-aware event processing:
 
 | Problem | Workaround in EventAdapter |
 |---|---|
-| `STATE_SNAPSHOT` contains full graph state (messages, template, error, version) — frontend only needs `template` | Extract `snapshot.get("template")`, rebuild `StateSnapshotEvent` with just the domain object |
-| Intermediate `STATE_SNAPSHOT` events fire when `template` is still `None` (graph entered node but LLM hasn't returned) | Skip snapshots where extracted value is `None` |
-| Frontend `useCoAgent` expects an empty object on new run start to clear stale state | Inject `StateSnapshotEvent(snapshot={})` immediately after `RUN_STARTED` |
-| `adispatch_custom_event("activity_snapshot", {...})` arrives as `EventType.CUSTOM` | Translate to `ActivitySnapshotEvent` with proper fields (message_id, activity_type, content) |
-| `adispatch_custom_event("state_delta", {"ops": [...]})` arrives as `EventType.CUSTOM` | Translate to `StateDeltaEvent` with `delta=ops` |
-
-Without the EventAdapter, the frontend would receive:
-- Full graph state (with `messages` array, `error`, `version`) instead of just the template object
-- Stale intermediate snapshots that would flash empty state in the UI
-- Raw `CUSTOM` events that CopilotKit doesn't understand
+| `STATE_SNAPSHOT` contains full graph state | Extract `snapshot.get(state_snapshot_key)`, rebuild `StateSnapshotEvent` |
+| Intermediate `STATE_SNAPSHOT` events fire when key is `None` | Skip snapshots where extracted value is `None` |
+| Frontend needs empty state on new run | Inject `StateSnapshotEvent(snapshot={})` after `RUN_STARTED` |
+| Custom events arrive as `EventType.CUSTOM` | Translate `"activity_snapshot"` → `ActivitySnapshotEvent`, `"state_delta"` → `StateDeltaEvent` |
+| Subgraph-internal STEP events clutter output | `allowed_step_names` filter drops non-parent steps |
+| Analysis text should show as reasoning, not chat | `reasoning_step_names` converts TEXT → REASONING for specified parent steps |
+| Library's auto MESSAGES_SNAPSHOT causes duplicates | Suppress `EventType.MESSAGES_SNAPSHOT` entirely |
 
 #### 8.3.2 Pub/Sub-Only Agent Runner
 
-The library produces event objects, not SSE strings. The existing `run_agent_background()` in `agent_runner.py` expects an `AsyncIterator[str]` of SSE lines. Two adaptations were needed:
-
-1. `EventAdapter.stream_events()` wraps `agent.run()` and yields `str` (via `EventEncoder.encode()`)
-2. `start_agent_task_pubsub_only()` was added to `agent_runner.py` for Pub/Sub-only publishing (no Redis List persistence)
-
-```python
-# agent_runner.py — Pub/Sub-only variant for library-based agents
-async def run_agent_pubsub_only(pubsub, thread_id, run_id, event_stream):
-    seq_counter = 0
-    async for event_sse in event_stream:
-        seq_counter += 1
-        await pubsub._redis.publish(
-            channel, json.dumps({"seq": seq_counter, "event": event_sse})
-        )
-    await pubsub.complete_run(thread_id, run_id)
-```
+Unchanged from before — `start_agent_task_pubsub_only()` publishes SSE strings to Pub/Sub only.
 
 #### 8.3.3 State Injection via RunAgentInput
 
-The library's `LangGraphAgent` needs to know the existing template state so `_route_by_state()` can choose between generate and modify. This requires packaging the state into `RunAgentInput`:
-
-```python
-# template/routes.py — _handle_chat()
-existing_template = None
-if state_data:
-    existing_template = state_data.get("template")
-
-input_data = RunAgentInput(
-    thread_id=thread_id,
-    run_id=run_id,
-    messages=agui_messages,
-    state={"template": existing_template} if existing_template else None,
-)
-```
-
-The segment agent doesn't need this — its checkpointer state automatically persists across invocations.
+Unchanged — `RunAgentInput.state` carries existing template and version for routing.
 
 #### 8.3.4 Custom Event Translation Pattern
 
-The graph nodes cannot emit proper AG-UI events directly. They use LangGraph's `adispatch_custom_event()` which becomes a `CUSTOM` event in the library's output. The EventAdapter then translates:
-
-```python
-# graph.py — inside generate/modify nodes
-await adispatch_custom_event(
-    "activity_snapshot",
-    {"title": "Generating template", "progress": 0.1, "details": "Starting..."},
-    config=config,
-)
-
-# event_adapter.py — translation
-if name == "activity_snapshot":
-    yield ActivitySnapshotEvent(
-        type=EventType.ACTIVITY_SNAPSHOT,
-        message_id=str(uuid.uuid4()),
-        activity_type="processing",
-        content=data,
-    )
-```
-
-This is a two-hop indirection: graph node → `adispatch_custom_event` → LangGraph `astream_events` → `LangGraphAgent.run()` → EventAdapter → SSE string. In the segment agent, it's a single hop: `emitter.emit_activity_snapshot()` → SSE string.
+Unchanged — `adispatch_custom_event()` → `CUSTOM` → EventAdapter translation.
 
 #### 8.3.5 Missing clone() Call (Concurrency Bug)
 
-The library documentation and test suite (`test_clone.py`) make clear that `LangGraphAgent` has mutable per-request state (`active_run`, message tracking). Each concurrent request needs `agent.clone()`:
+Still present — `template_agent` on `app.state` is shared without `clone()`.
+
+### 8.4 Common Reconnection Handler
+
+The 3-tier reconnection pattern is now extracted into `core/reconnect.py`, shared by both checkpointer-based agents:
 
 ```python
-# endpoint.py (library) — correct pattern
-agent_instance = agent.clone()  # fresh copy per request
-async for event in agent_instance.run(input_data):
-    ...
+@dataclass
+class ReconnectConfig:
+    node_meta: dict[str, dict]
+    state_snapshot_key: str
+    emit_catchup: Callable         # agent-specific catch-up generator
+    get_completed_count: Callable   # agent-specific progress counter
+    serialize_snapshot: Callable    # optional serialization (default: identity)
 ```
 
-The template agent stores a single `template_agent` on `request.app.state` and passes it directly to `EventAdapter.stream_events()` without cloning. Two simultaneous requests would corrupt shared state. This is a bug, not an intentional workaround.
+| Agent | Catch-up content | Serialize |
+|-------|-----------------|-----------|
+| Stateful-segment | Progress steps, segment card, chat history | `segment.model_dump()` |
+| Template | Progress steps, analysis reasoning, quality reports, template, chat history | Identity (template is already a dict) |
+| Segment | N/A (uses Redis List replay) | N/A |
 
-### 8.4 What the Library Provides for Free
+### 8.5 What the Library Provides for Free
 
-#### 8.4.1 Automatic Text Message Streaming
+#### 8.5.1 Automatic Text Message Streaming
 
 The library hooks into `on_chat_model_stream` events from `astream_events(version="v2")` and automatically emits:
 
@@ -2879,7 +3218,7 @@ The segment agent would need ~15 lines of manual emission per text stream. The t
 
 However, for the template agent this is somewhat wasted: the LLM uses `with_structured_output(EmailTemplate)`, so the "text" streamed is actually JSON fragments of the structured output, not user-visible prose. The frontend doesn't display this text stream — it waits for the final `STATE_SNAPSHOT` with the assembled template.
 
-#### 8.4.2 Automatic MESSAGES_SNAPSHOT
+#### 8.5.2 Automatic MESSAGES_SNAPSHOT
 
 At the end of every run, the library emits a `MESSAGES_SNAPSHOT` containing the full conversation history converted from LangChain format to AG-UI format. This handles:
 
@@ -2896,7 +3235,7 @@ agui_messages = emitter.langchain_messages_to_agui(lc_messages)
 yield emitter.emit_messages_snapshot(agui_messages, thread_id)
 ```
 
-#### 8.4.3 Automatic Run Lifecycle
+#### 8.5.3 Automatic Run Lifecycle
 
 `RUN_STARTED`, `RUN_FINISHED`, and `RUN_ERROR` are all emitted automatically by `_handle_stream_events()`. The segment agent manually emits each:
 
@@ -2908,7 +3247,7 @@ yield emitter.emit_run_finished(run_id)
 
 Error handling in the library is also automatic — if the graph throws, `RUN_FINISHED` is emitted with the error.
 
-#### 8.4.4 State Snapshot Suppression Logic
+#### 8.5.4 State Snapshot Suppression Logic
 
 The library has sophisticated logic to avoid emitting stale state snapshots when tool calls are in flight:
 
@@ -2919,7 +3258,7 @@ suppressed = exiting_node and (model_made_tool_call or not state_reliable)
 
 This prevents the frontend from flashing stale state between tool call and tool result. The segment agent doesn't need this (no tool calls), but if it were extended with tools, implementing equivalent suppression manually would be non-trivial.
 
-#### 8.4.5 Real LLM Reasoning Support
+#### 8.5.5 Real LLM Reasoning Support
 
 If `ChatAnthropic` is configured with `extended_thinking=True`, the library automatically:
 
@@ -2937,7 +3276,7 @@ if isinstance(chunk, AIMessageChunk):
 
 The segment agent's reasoning is **simulated** (hardcoded strings from `NODE_META`). To get real LLM reasoning in the segment agent, you'd need to manually parse `AIMessageChunk` objects and emit reasoning events — roughly 40-50 lines of code per reasoning stream. The library does this automatically.
 
-#### 8.4.6 Message Format Conversion
+#### 8.5.6 Message Format Conversion
 
 The library provides bidirectional message conversion (`agui_messages_to_langchain()` and `langchain_messages_to_agui()`) including:
 
@@ -2948,7 +3287,7 @@ The library provides bidirectional message conversion (`agui_messages_to_langcha
 
 The segment agent implements a simpler version in `EventEmitter.langchain_messages_to_agui()` (events.py, 30 lines). The library's version (~100 lines in utils.py) handles more edge cases.
 
-#### 8.4.7 Time-Travel and Interrupt/Resume
+#### 8.5.7 Time-Travel and Interrupt/Resume
 
 The library supports:
 
@@ -2957,53 +3296,60 @@ The library supports:
 
 Neither feature is used by the template agent currently, but they're available without additional code. The segment agent would need significant manual implementation to support either.
 
-### 8.5 Code Volume Comparison
+### 8.6 Code Volume Comparison
 
-| Component | Segment Agent | Template Agent | Delta |
+| Component | Segment Agent | Template Agent | Notes |
 |---|---|---|---|
-| **Graph definition** | 355 lines (`graph.py`) | 255 lines (`graph.py`) | -100 lines (no `NODE_META`, simpler nodes) |
-| **Routes / endpoint** | 546 lines (`routes.py`) | 358 lines (`routes.py`) | -188 lines |
-| **Event infrastructure** | 253 lines (`events.py`) — shared EventEmitter | 113 lines (`event_adapter.py`) — template-specific | -140 lines (but EventAdapter is additional to EventEmitter) |
-| **Pipeline orchestration** | ~170 lines in `run_segment_pipeline()` | 0 lines (library handles) | -170 lines |
-| **Node metadata** | 115 lines (`NODE_META` dict) | 0 lines | -115 lines |
+| **Graph definition** | 354 lines (`graph.py`) | 305 lines (`graph.py`) + 391 lines (`analysis_graph.py`) + 230 lines (`quality_graph.py`) = **926 lines** | Template has far more graph code due to two subgraphs |
+| **State definitions** | Inline in `graph.py` | 49 lines (`state.py`) | Template uses separate state module |
+| **Routes / endpoint** | 545 lines (`routes.py`) | 432 lines (`routes.py`) | Template routes include catch-up emitters for reasoning + quality |
+| **Event infrastructure** | 252 lines (`events.py`) — shared EventEmitter | 214 lines (`event_adapter.py`) | EventAdapter handles subgraph filtering, reasoning conversion |
+| **Shared reconnect** | N/A (uses Redis List) | 207 lines (`core/reconnect.py`) — shared with stateful-segment | Common handler extracted |
+| **Pipeline orchestration** | ~170 lines in `run_segment_pipeline()` | 0 lines (library handles) | Library provides `agent.run()` |
 | **Custom event wiring** | 0 lines (events emitted directly) | 22 lines (`_translate_custom()`) | +22 lines |
-| **State filtering** | 0 lines (emit exactly what you want) | 15 lines (EventAdapter STATE_SNAPSHOT filtering) | +15 lines |
-| **Total endpoint-specific** | ~900 lines | ~615 lines | **-285 lines (~32% less)** |
+| **Total backend** | ~1,150 lines | ~1,830 lines | Template is **larger** due to subgraph complexity |
 
-The template agent saves ~285 lines, but this includes the loss of multi-step progress, reasoning panels, and incremental state deltas. If equivalent features were added (requiring library workarounds), the savings would shrink significantly.
+The template agent is now **more code** than the segment agent, not less. The subgraph architecture (analysis_graph.py + quality_graph.py = 621 lines) and the EventAdapter workarounds (214 lines) add significant volume. The library saves ~170 lines of pipeline orchestration and ~20 lines of run lifecycle, but the subgraph composition, event filtering, reasoning conversion, and synthetic catch-up reconstruction more than offset those savings.
 
-### 8.6 Frontend Impact
+However, the comparison is not apples-to-apples: the template agent does **more** than the segment agent. It runs 4 parallel analysis nodes, 3 quality check nodes, conditional template improvement, and converts real LLM output into reasoning panels. The segment agent has a simpler pipeline with simulated reasoning. Line count alone does not measure feature density.
+
+### 8.7 Frontend Impact
 
 | Aspect | Segment Frontend | Template Frontend |
 |---|---|---|
-| **Hooks used** | `useCoAgent`, `useCoAgentStateRender`, `useCopilotAction`, `useState`, `useEffect` | `useCoAgent`, `useCoAgentStateRender` |
-| **Local state** | `progressStatus` (node/index/total tracking) | None |
-| **Custom action handler** | `update_progress_status` (intercepts fake tool calls) | None |
-| **Main content area** | `<ProgressStatus>` + `<SegmentCard>` | `<TemplateEditor>` + `<TemplatePreview>` |
-| **Message rendering** | Complex filtering (checks for newer user/assistant/same-role messages) | Simpler filtering (checks for newer assistant messages) |
+| **Page lines** | 135 lines (`segment/page.tsx`) | 225 lines (`template/page.tsx`) |
+| **Hooks used** | `useCoAgent`, `useCoAgentStateRender`, `useCopilotAction`, `useState`, `useEffect` | `useCoAgent`, `useCoAgentStateRender`, `useCopilotAction`, `useState`, `useEffect` |
+| **Local state** | `progressStatus` (node/index/total tracking) | `progressStatus` (node/index/total tracking) |
+| **Custom action handler** | `update_progress_status` (intercepts fake tool calls) | `update_progress_status` (same pattern as segment) |
+| **Main content area** | `<ProgressStatus>` + `<SegmentCard>` | `<ProgressStatus>` + `<TemplateEditor>` + `<TemplatePreview>` |
+| **Domain components** | 76 lines (`SegmentCard.tsx`) | 40 lines (`TemplateEditor.tsx`) + 71 lines (`TemplatePreview.tsx`) = 111 lines |
+| **Shared components** | `ProgressStatus` (149 lines), `ActivityIndicator` (34 lines), `ReasoningPanel` (32 lines) | Same shared components |
 | **State render callback** | Returns `null` (card shown inline via `InlineSegmentCard`) | Returns green banner with subject line |
-| **Lines of code** | ~120 lines | ~95 lines |
 
-The template frontend is simpler, but this is partly because it lacks features (no progress bar, no inline state cards). The `TemplateEditor`/`TemplatePreview` components add ~80 lines for the editable iframe, which is domain-specific rather than agent-protocol related.
+Both frontends now share the same feature set: progress bar via `useCopilotAction("update_progress_status")`, reasoning panels (via CopilotKit's built-in reasoning support), activity indicators, and inline state rendering. The template frontend is slightly larger due to the editable iframe preview (`TemplatePreview`) and the template editor with section-level editing.
 
-### 8.7 Verdict: When Each Approach Wins
+### 8.8 Verdict: When Each Approach Wins
 
 **Use manual event emission (segment pattern) when:**
 - You need granular control over UX timing (simulated reasoning with delays, step-by-step progress)
-- The pipeline has multiple visible stages that the user should see progressing
 - You need incremental state updates (JSON Patch deltas) during processing
-- You want to emit fake tool calls for frontend `useCopilotAction` handlers
 - Full event replay on reconnection matters (Redis List persistence)
+- The pipeline is straightforward and doesn't benefit from subgraph composition
+- You want the simplest mental model: emit exactly the events you want, when you want them
 
 **Use ag-ui-langgraph (template pattern) when:**
-- The agent is a simple LLM call (or few nodes) where intermediate UX isn't critical
-- You want real LLM features for free (text streaming, reasoning from extended thinking, message conversion)
+- The agent has complex subgraph composition (fan-out/fan-in, conditional routing, nested pipelines)
+- You want real LLM output in reasoning panels rather than simulated text
 - You plan to use tool-calling agents where state snapshot suppression matters
 - You want time-travel or interrupt/resume without manual implementation
-- Reducing boilerplate is a priority and the EventAdapter workarounds are acceptable
+- The graph already uses `astream_events()` and you want events auto-translated to AG-UI
 
-**Hybrid approach** (not yet implemented but viable):
-- Use `ag-ui-langgraph` for the LLM interaction layer (message conversion, run lifecycle, tool handling)
-- Supplement with `adispatch_custom_event()` for step progress, translated by EventAdapter
-- Use `ManuallyEmitState` custom events for incremental state deltas
-- Accept that simulated reasoning requires either real extended thinking or bypassing the library for those events
+**Key insight from this project:** The library does not reduce code volume when the agent is complex. The template agent (with subgraphs, reasoning conversion, multi-step progress, and checkpointer-based catch-up) is ~1,830 lines vs the segment agent's ~1,150 lines. The savings on run lifecycle and text streaming (~190 lines) are offset by the EventAdapter workarounds (~214 lines), subgraph definitions (~621 lines), and synthetic catch-up emitters.
+
+Where the library shines is **feature density per line**: those 214 EventAdapter lines provide subgraph-aware step filtering, TEXT→REASONING conversion, STATE_SNAPSHOT extraction, and MESSAGES_SNAPSHOT suppression. Implementing equivalent features manually (parsing `astream_events()`, handling reasoning tokens across providers, state snapshot suppression during tool calls) would require substantially more code.
+
+**Shared patterns that emerged:**
+- Both agents use `useCopilotAction("update_progress_status")` for progress bars — the frontend is identical
+- Both checkpointer-based agents share `core/reconnect.py` for the 3-tier connect pattern
+- Both use `EventEmitter` for catch-up event generation (even the template agent, during synthetic reconnection)
+- The `ProgressStatus` component, `ReasoningPanel`, and `ActivityIndicator` are fully shared across all agents
