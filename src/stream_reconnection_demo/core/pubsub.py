@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 from typing import AsyncIterator, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,8 @@ class PubSubManager(Protocol):
     async def subscribe_and_stream(self, thread_id: str, run_id: str, last_seq: int = 0) -> AsyncIterator[str]: ...
     async def catch_up_and_follow(self, thread_id: str, run_id: str) -> AsyncIterator[str]: ...
     async def publish_event_pubsub_only(self, thread_id: str, run_id: str, event_data: str, seq: int) -> None: ...
+    def open_subscription(self, thread_id: str, run_id: str): ...
+    async def ping(self) -> bool: ...
     async def close(self) -> None: ...
 
 
@@ -242,6 +245,52 @@ class InMemoryPubSubManager:
         key = self._key(thread_id, run_id)
         envelope = json.dumps({"seq": seq, "event": event_data})
         self._publish_to_channel(key, envelope)
+
+    # -- subscription context manager ----------------------------------------
+
+    @asynccontextmanager
+    async def open_subscription(self, thread_id: str, run_id: str):
+        """Subscribe to live events and yield an async event iterator.
+
+        Events are buffered from the moment the context is entered,
+        allowing the caller to do catch-up work before consuming.
+        The iterator yields SSE event strings and terminates on
+        STREAM_END/STREAM_ERROR sentinels or terminal run status.
+        """
+        key = self._key(thread_id, run_id)
+        q: asyncio.Queue[str] = asyncio.Queue()
+        subs = self._subscribers.setdefault(key, set())
+        subs.add(q)
+
+        async def _events() -> AsyncIterator[str]:
+            while True:
+                try:
+                    raw = await asyncio.wait_for(q.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    status = await self.get_run_status(thread_id, run_id)
+                    if status in ("completed", "error", None):
+                        return
+                    continue
+
+                if raw in (STREAM_END, STREAM_ERROR):
+                    return
+
+                try:
+                    envelope = json.loads(raw)
+                    yield envelope["event"]
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    continue
+
+        try:
+            yield _events()
+        finally:
+            subs.discard(q)
+
+    # -- health check --------------------------------------------------------
+
+    async def ping(self) -> bool:
+        """Return True — in-memory backend is always available."""
+        return True
 
     # -- cleanup ------------------------------------------------------------
 
@@ -573,6 +622,64 @@ class RedisPubSubManager:
         await self._redis.publish(
             self._channel_key(thread_id, run_id), envelope
         )
+
+    # ------------------------------------------------------------------
+    # Subscription context manager
+    # ------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def open_subscription(self, thread_id: str, run_id: str):
+        """Subscribe to live events and yield an async event iterator.
+
+        Events are buffered from the moment the context is entered,
+        allowing the caller to do catch-up work before consuming.
+        The iterator yields SSE event strings and terminates on
+        STREAM_END/STREAM_ERROR sentinels or terminal run status.
+        """
+        channel_name = self._channel_key(thread_id, run_id)
+        pubsub = self._redis.pubsub()
+        await pubsub.subscribe(channel_name)
+
+        async def _events() -> AsyncIterator[str]:
+            while True:
+                msg = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=5.0
+                )
+
+                if msg is None:
+                    status = await self.get_run_status(thread_id, run_id)
+                    if status in ("completed", "error", None):
+                        return
+                    continue
+
+                if msg["type"] != "message":
+                    continue
+
+                raw: str = msg["data"]
+
+                if raw in (STREAM_END, STREAM_ERROR):
+                    return
+
+                try:
+                    envelope = json.loads(raw)
+                    yield envelope["event"]
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    continue
+
+        try:
+            yield _events()
+        finally:
+            await pubsub.unsubscribe(channel_name)
+            await pubsub.aclose()
+
+    # ------------------------------------------------------------------
+    # Health check
+    # ------------------------------------------------------------------
+
+    async def ping(self) -> bool:
+        """Verify Redis connectivity."""
+        await self._redis.ping()
+        return True
 
     # ------------------------------------------------------------------
     # Cleanup

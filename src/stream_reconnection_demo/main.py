@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
     try:
         pubsub = RedisPubSubManager(redis_url)
         # Probe the connection to verify Redis is reachable
-        await pubsub._redis.ping()
+        await pubsub.ping()
         app.state.pubsub = pubsub
         logger.info("Redis Pub/Sub manager initialized")
     except Exception:

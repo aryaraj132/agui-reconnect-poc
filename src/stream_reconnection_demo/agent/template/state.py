@@ -36,7 +36,10 @@ class TemplateAgentState(TypedDict):
     analyses: Annotated[list[AnalysisResult], add]
     overall_assessment: str | None
     needs_improvement: bool
-    # Subgraph B field (mapped manually by wrapper):
+    # Subgraph B fields (mapped manually by wrapper):
+    spelling_report: str | None
+    tone_report: str | None
+    cta_report: str | None
     quality_summary: str | None
 
 

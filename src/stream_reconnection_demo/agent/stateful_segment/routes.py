@@ -17,6 +17,10 @@ from langchain_core.messages import HumanMessage
 
 from stream_reconnection_demo.core.events import EventEmitter, extract_user_query, get_field
 from stream_reconnection_demo.core.middleware import LoggingMiddleware
+from stream_reconnection_demo.core.reconnect import (
+    ReconnectConfig,
+    handle_checkpointer_connect,
+)
 
 router = APIRouter(prefix="/api/v1")
 emitter = EventEmitter()
@@ -126,19 +130,6 @@ NODE_STATE_FIELDS = {
     "estimate_scope": "scope_estimate",
     "build_segment": "segment",
 }
-
-
-def _extract_step_name_from_sse(event_data: str) -> str | None:
-    """Extract the step name from a STEP_STARTED SSE event string."""
-    for line in event_data.split("\n"):
-        if line.startswith("data:"):
-            json_str = line[5:].lstrip()
-            try:
-                payload = json.loads(json_str)
-                return payload.get("stepName") or payload.get("step_name")
-            except (ValueError, TypeError):
-                pass
-    return None
 
 
 async def run_stateful_segment_pipeline(
@@ -400,6 +391,28 @@ async def _emit_synthetic_catchup(
             yield emitter.emit_tool_call_end(completion_tool_id)
 
 
+def _get_completed_count(state: dict, next_nodes: tuple = ()) -> int:
+    """Return just the completed_count for ReconnectConfig."""
+    _, completed_count = _reconstruct_progress_from_state(state, next_nodes)
+    return completed_count
+
+
+def _serialize_segment(segment):
+    """Serialize a segment for STATE_SNAPSHOT."""
+    if hasattr(segment, "model_dump"):
+        return segment.model_dump()
+    return segment
+
+
+RECONNECT_CONFIG = ReconnectConfig(
+    node_meta=NODE_META,
+    state_snapshot_key="segment",
+    emit_catchup=_emit_synthetic_catchup,
+    get_completed_count=_get_completed_count,
+    serialize_snapshot=_serialize_segment,
+)
+
+
 @router.get("/stateful-segment/state/{thread_id}")
 async def get_stateful_segment_state(thread_id: str, request: Request):
     """Return current segment state from checkpointer for a given thread."""
@@ -444,156 +457,13 @@ async def generate_stateful_segment(request: Request):
     )
 
     if request_type == "connect":
-        return await _handle_stateful_connect(
-            pubsub, segment_graph, thread_id, run_id
+        return await handle_checkpointer_connect(
+            pubsub, segment_graph, thread_id, run_id, RECONNECT_CONFIG
         )
 
     return await _handle_stateful_chat(
         pubsub, segment_graph, thread_id, run_id, query
     )
-
-
-async def _handle_stateful_connect(pubsub, segment_graph, thread_id: str, run_id: str):
-    """Handle Connect — catch-up from checkpointer, then bridge to live Pub/Sub."""
-
-    # Check for active run
-    active_run_id = None
-    try:
-        active_run_id = await pubsub.get_active_run(thread_id)
-    except Exception:
-        logger.warning("Failed to check active run for thread %s", thread_id)
-
-    if active_run_id:
-        # Active run — subscribe to pub/sub first, then emit checkpointer state
-        logger.info(
-            "Stateful connect: active run %s, catching up from checkpointer",
-            active_run_id,
-        )
-
-        async def reconnect_stream():
-            from stream_reconnection_demo.core.pubsub import STREAM_END, STREAM_ERROR
-
-            # Step 1: Subscribe to Pub/Sub (buffer live events)
-            channel_key = pubsub._channel_key(thread_id, active_run_id)
-            ps = pubsub._redis.pubsub()
-            await ps.subscribe(channel_key)
-
-            try:
-                # Step 2: Read checkpointer state and track which nodes
-                # are already covered so we can deduplicate against
-                # live Pub/Sub events that arrive for the same nodes.
-                catchup_node_index = -1
-                try:
-                    checkpoint_state = await segment_graph.aget_state(
-                        {"configurable": {"thread_id": thread_id}}
-                    )
-                except Exception:
-                    checkpoint_state = None
-
-                # Step 3: Emit synthetic catch-up events from checkpointer.
-                # Pub/Sub events for completed nodes are ephemeral and
-                # already lost, so we must reconstruct them from state.
-                if checkpoint_state and checkpoint_state.values:
-                    next_nodes = getattr(checkpoint_state, "next", ())
-                    _, completed_count = _reconstruct_progress_from_state(
-                        checkpoint_state.values, next_nodes
-                    )
-                    catchup_node_index = completed_count - 1
-
-                    async for event in _emit_synthetic_catchup(
-                        checkpoint_state.values, thread_id, run_id, next_nodes
-                    ):
-                        yield event
-
-                # Step 4: Yield live events from Pub/Sub, skipping events
-                # for nodes already covered by synthetic catch-up.
-                past_catchup = catchup_node_index < 0
-
-                while True:
-                    message = await ps.get_message(
-                        ignore_subscribe_messages=True, timeout=5.0
-                    )
-                    if message is None:
-                        status = await pubsub.get_run_status(thread_id, active_run_id)
-                        if status in ("completed", "error"):
-                            if not past_catchup:
-                                yield emitter.emit_run_finished(thread_id, run_id)
-                            return
-                        continue
-
-                    if message["type"] != "message":
-                        continue
-
-                    raw = message["data"]
-
-                    # Sentinels are plain strings, not JSON — check first
-                    if raw in (STREAM_END, STREAM_ERROR):
-                        if not past_catchup:
-                            yield emitter.emit_run_finished(thread_id, run_id)
-                        return
-
-                    try:
-                        parsed = json.loads(raw)
-                        event_data = parsed.get("event", "")
-                    except (ValueError, TypeError):
-                        continue
-
-                    # Skip events for nodes already covered by catch-up.
-                    # Start yielding once we see a new node or post-pipeline
-                    # event. This prevents progress from jumping backward.
-                    if not past_catchup:
-                        if "STEP_STARTED" in event_data:
-                            step_name = _extract_step_name_from_sse(event_data)
-                            if step_name and step_name in NODE_META:
-                                if NODE_META[step_name]["index"] > catchup_node_index:
-                                    past_catchup = True
-                        elif ("TEXT_MESSAGE_START" in event_data
-                              or "RUN_FINISHED" in event_data):
-                            past_catchup = True
-
-                        if not past_catchup:
-                            continue
-
-                    yield event_data
-            finally:
-                await ps.unsubscribe(channel_key)
-                await ps.aclose()
-
-        return StreamingResponse(
-            reconnect_stream(), media_type=emitter.content_type
-        )
-
-    # No active run — check checkpointer for completed state
-    try:
-        checkpoint_state = await segment_graph.aget_state(
-            {"configurable": {"thread_id": thread_id}}
-        )
-    except Exception:
-        checkpoint_state = None
-
-    if checkpoint_state and checkpoint_state.values:
-        logger.info("Stateful connect: completed state from checkpointer for thread %s", thread_id)
-
-        async def completed_stream():
-            async for event in _emit_synthetic_catchup(
-                checkpoint_state.values, thread_id, run_id,
-                getattr(checkpoint_state, "next", ())
-            ):
-                yield event
-            yield emitter.emit_run_finished(thread_id, run_id)
-
-        return StreamingResponse(
-            completed_stream(), media_type=emitter.content_type
-        )
-
-    # Nothing found
-    logger.info("Stateful connect: no state for thread %s", thread_id)
-
-    async def empty_stream():
-        yield emitter.emit_run_started(thread_id, run_id)
-        yield emitter.emit_run_finished(thread_id, run_id)
-
-    return StreamingResponse(empty_stream(), media_type=emitter.content_type)
 
 
 async def _handle_stateful_chat(pubsub, segment_graph, thread_id: str, run_id: str, query: str):
@@ -603,8 +473,8 @@ async def _handle_stateful_chat(pubsub, segment_graph, thread_id: str, run_id: s
         # No query — treat like a connect to restore any existing state.
         # This handles the case where CopilotKit sends requestType=chat
         # with empty messages on page reload (frontend lost message history).
-        return await _handle_stateful_connect(
-            pubsub, segment_graph, thread_id, run_id
+        return await handle_checkpointer_connect(
+            pubsub, segment_graph, thread_id, run_id, RECONNECT_CONFIG
         )
 
     # Check if this query was already processed (prevents CopilotKit re-run loop)
@@ -648,57 +518,20 @@ async def _handle_stateful_chat(pubsub, segment_graph, thread_id: str, run_id: s
     except Exception:
         logger.warning("Failed to register run in Redis")
 
-    # Subscribe to Pub/Sub BEFORE starting the task so no events are lost.
-    # Without this, the background task publishes RUN_STARTED (and more)
-    # before subscribe_and_stream connects, causing "First event must be
-    # RUN_STARTED" errors on the frontend.
-    from stream_reconnection_demo.core.pubsub import STREAM_END, STREAM_ERROR
-    channel_key = pubsub._channel_key(thread_id, run_id)
-    ps = pubsub._redis.pubsub()
-    await ps.subscribe(channel_key)
-
-    # Now start the background task — events are buffered in `ps`
+    # Now start the background task
     pipeline_stream = run_stateful_segment_pipeline(
         segment_graph, query, thread_id, run_id
     )
 
     from stream_reconnection_demo.core.agent_runner import start_agent_task_pubsub_only
-    start_agent_task_pubsub_only(pubsub, segment_graph, thread_id, run_id, pipeline_stream)
 
-    # Stream from the already-subscribed channel
     async def live_stream():
-        try:
-            while True:
-                msg = await ps.get_message(
-                    ignore_subscribe_messages=True, timeout=5.0
-                )
-                if msg is None:
-                    status = await pubsub.get_run_status(thread_id, run_id)
-                    if status in ("completed", "error", None):
-                        return
-                    continue
+        # Subscribe BEFORE starting the background task so no events are lost.
+        async with pubsub.open_subscription(thread_id, run_id) as events:
+            start_agent_task_pubsub_only(pubsub, segment_graph, thread_id, run_id, pipeline_stream)
 
-                if msg["type"] != "message":
-                    continue
-
-                raw = msg["data"]
-
-                # Sentinels are plain strings, not JSON envelopes
-                if raw in (STREAM_END, STREAM_ERROR):
-                    return
-
-                try:
-                    envelope = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-
-                yield envelope["event"]
-        except Exception:
-            logger.exception("Stateful live stream failed for run %s", run_id)
-            yield emitter.emit_run_error("Stream failed")
-        finally:
-            await ps.unsubscribe(channel_key)
-            await ps.aclose()
+            async for event in events:
+                yield event
 
     return StreamingResponse(
         live_stream(), media_type=emitter.content_type

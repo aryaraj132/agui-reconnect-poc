@@ -254,7 +254,12 @@ def _build_quality_check_node(model: str):
             {"template": template},
             config=config,
         )
-        return {"quality_summary": result.get("quality_summary", "")}
+        return {
+            "spelling_report": result.get("spelling_report"),
+            "tone_report": result.get("tone_report"),
+            "cta_report": result.get("cta_report"),
+            "quality_summary": result.get("quality_summary", ""),
+        }
 
     return quality_check_node
 

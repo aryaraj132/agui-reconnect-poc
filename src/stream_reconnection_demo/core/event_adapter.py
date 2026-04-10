@@ -14,6 +14,11 @@ from typing import AsyncIterator
 from ag_ui.core import (
     ActivitySnapshotEvent,
     EventType,
+    ReasoningEndEvent,
+    ReasoningMessageContentEvent,
+    ReasoningMessageEndEvent,
+    ReasoningMessageStartEvent,
+    ReasoningStartEvent,
     RunAgentInput,
     StateDeltaEvent,
     StateSnapshotEvent,
@@ -40,6 +45,8 @@ class EventAdapter:
         input_data: RunAgentInput,
         *,
         state_snapshot_key: str = "template",
+        allowed_step_names: set[str] | None = None,
+        reasoning_step_names: set[str] | None = None,
     ) -> AsyncIterator[str]:
         """Run the agent and yield SSE-encoded event strings.
 
@@ -52,7 +59,22 @@ class EventAdapter:
         state_snapshot_key:
             The key in STATE_SNAPSHOT to check. Intermediate snapshots
             where this key is ``None`` are suppressed.
+        allowed_step_names:
+            If provided, only STEP_STARTED/STEP_FINISHED events whose
+            step_name is in this set will be emitted.  Subgraph-internal
+            nodes are silently dropped.
+        reasoning_step_names:
+            Parent step names whose subgraph TEXT_MESSAGE events should be
+            converted to REASONING events (single consolidated panel per
+            step).  Subgraph TEXT under other parent steps passes through
+            unchanged as regular messages.
         """
+        in_subgraph = False
+        current_parent_step: str | None = None
+        reasoning_active = False
+        reasoning_msg_id: str | None = None
+        activity_msg_id = str(uuid.uuid4())
+
         async for event_obj in agent.run(input_data):
             logger.debug(
                 "EventAdapter raw event: type=%s name=%s",
@@ -61,9 +83,84 @@ class EventAdapter:
             )
             # --- Custom event translation ---------------------------------
             if event_obj.type == EventType.CUSTOM:
-                async for translated in self._translate_custom(event_obj):
+                async for translated in self._translate_custom(
+                    event_obj, activity_msg_id
+                ):
                     yield self._encoder.encode(translated)
                 continue
+
+            # --- MESSAGES_SNAPSHOT suppression -----------------------------
+            # Suppress to prevent user message reappearing at bottom.
+            # CopilotKit already has messages from individual TEXT_MESSAGE
+            # events during live stream; catch-up emits its own snapshot.
+            if event_obj.type == EventType.MESSAGES_SNAPSHOT:
+                continue
+
+            # --- STEP event filtering + subgraph tracking -----------------
+            if allowed_step_names and event_obj.type in (
+                EventType.STEP_STARTED, EventType.STEP_FINISHED
+            ):
+                step_name = getattr(event_obj, "step_name", "")
+                if step_name in allowed_step_names:
+                    # Close any active reasoning session when leaving subgraph
+                    if reasoning_active:
+                        yield self._encoder.encode(
+                            ReasoningMessageEndEvent(message_id=reasoning_msg_id)
+                        )
+                        yield self._encoder.encode(
+                            ReasoningEndEvent(message_id=reasoning_msg_id)
+                        )
+                        reasoning_active = False
+                        reasoning_msg_id = None
+                    in_subgraph = False
+                    if event_obj.type == EventType.STEP_STARTED:
+                        current_parent_step = step_name
+                else:
+                    if event_obj.type == EventType.STEP_STARTED:
+                        in_subgraph = True
+                    continue
+
+            # --- TEXT_MESSAGE → REASONING (only for reasoning_step_names) --
+            convert_to_reasoning = (
+                in_subgraph
+                and allowed_step_names
+                and reasoning_step_names
+                and current_parent_step in reasoning_step_names
+            )
+
+            if convert_to_reasoning:
+                if event_obj.type == EventType.TEXT_MESSAGE_START:
+                    if not reasoning_active:
+                        reasoning_msg_id = str(uuid.uuid4())
+                        yield self._encoder.encode(
+                            ReasoningStartEvent(message_id=reasoning_msg_id)
+                        )
+                        yield self._encoder.encode(
+                            ReasoningMessageStartEvent(
+                                message_id=reasoning_msg_id, role="reasoning"
+                            )
+                        )
+                        reasoning_active = True
+                    else:
+                        # Separator between analysis outputs in same panel
+                        yield self._encoder.encode(
+                            ReasoningMessageContentEvent(
+                                message_id=reasoning_msg_id, delta="\n---\n"
+                            )
+                        )
+                    continue
+                if event_obj.type == EventType.TEXT_MESSAGE_CONTENT:
+                    delta = getattr(event_obj, "delta", "")
+                    yield self._encoder.encode(
+                        ReasoningMessageContentEvent(
+                            message_id=reasoning_msg_id, delta=delta
+                        )
+                    )
+                    continue
+                if event_obj.type == EventType.TEXT_MESSAGE_END:
+                    # Don't close session — more subgraph nodes may follow.
+                    # Session closes when parent step ends (allowed STEP event).
+                    continue
 
             # --- STATE_SNAPSHOT filtering + extraction ----------------------
             # Extract just the state_snapshot_key value (e.g. "template")
@@ -93,7 +190,7 @@ class EventAdapter:
 
             yield self._encoder.encode(event_obj)
 
-    async def _translate_custom(self, event_obj):
+    async def _translate_custom(self, event_obj, activity_msg_id: str | None = None):
         """Translate CUSTOM events to proper AG-UI event types."""
         name = getattr(event_obj, "name", "")
         data = getattr(event_obj, "value", {})
@@ -101,7 +198,7 @@ class EventAdapter:
         if name == "activity_snapshot":
             yield ActivitySnapshotEvent(
                 type=EventType.ACTIVITY_SNAPSHOT,
-                message_id=str(uuid.uuid4()),
+                message_id=activity_msg_id or str(uuid.uuid4()),
                 activity_type="processing",
                 content=data,
             )

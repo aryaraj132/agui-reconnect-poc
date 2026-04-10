@@ -7,7 +7,6 @@ Redis Pub/Sub for live event streaming only (no List).
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
@@ -22,11 +21,111 @@ from stream_reconnection_demo.core.events import (
     extract_user_query,
     get_field,
 )
-from stream_reconnection_demo.core.pubsub import STREAM_END, STREAM_ERROR
+from stream_reconnection_demo.core.reconnect import (
+    ReconnectConfig,
+    handle_checkpointer_connect,
+)
 
 router = APIRouter(prefix="/api/v1")
 emitter = EventEmitter()
 logger = logging.getLogger(__name__)
+
+# Node metadata for progress tracking.
+# generate_template and modify_template share index 0 (conditional routing).
+NODE_META = {
+    "generate_template": {
+        "index": 0, "progress": 0.15, "status": "generating",
+        "title": "Generating Template",
+        "details": "Creating email template with LLM...",
+    },
+    "modify_template": {
+        "index": 0, "progress": 0.15, "status": "modifying",
+        "title": "Modifying Template",
+        "details": "Applying changes to template...",
+    },
+    "analyze_template": {
+        "index": 1, "progress": 0.50, "status": "analyzing",
+        "title": "Analyzing Template",
+        "details": "Running HTML analysis (subject, colors, typography, structure)...",
+    },
+    "quality_check": {
+        "index": 2, "progress": 0.85, "status": "checking",
+        "title": "Quality Check",
+        "details": "Checking spelling, tone, and CTA effectiveness...",
+    },
+}
+
+TOTAL_NODES = 3
+
+# Ordered node lists for the two execution paths
+NODE_ORDER_GENERATE = ["generate_template", "analyze_template", "quality_check"]
+NODE_ORDER_MODIFY = ["modify_template", "analyze_template", "quality_check"]
+
+# State fields that indicate a node has completed
+NODE_STATE_FIELDS = {
+    "generate_template": "template",
+    "modify_template": "template",
+    "analyze_template": "overall_assessment",
+    "quality_check": "quality_summary",
+}
+
+
+def _determine_node_order(state: dict, next_nodes: tuple = ()) -> list[str]:
+    """Determine which execution path was taken (generate vs modify)."""
+    # If next_nodes mentions a specific first node, use that path
+    if next_nodes:
+        first = next_nodes[0]
+        if first == "generate_template":
+            return NODE_ORDER_GENERATE
+        if first == "modify_template":
+            return NODE_ORDER_MODIFY
+
+    # If template exists, determine from version
+    version = state.get("version", 0)
+    if version > 1:
+        return NODE_ORDER_MODIFY
+    if version == 1:
+        return NODE_ORDER_GENERATE
+
+    # Fallback: check if template field is populated
+    if state.get("template") is not None:
+        return NODE_ORDER_GENERATE
+
+    return NODE_ORDER_GENERATE
+
+
+def _reconstruct_progress_from_state(
+    state: dict, next_nodes: tuple = ()
+) -> tuple[str | None, int, list[str]]:
+    """Determine the last completed node from checkpointer state.
+
+    Returns (last_completed_node, completed_count, node_order).
+    """
+    node_order = _determine_node_order(state, next_nodes)
+
+    # Prefer checkpoint metadata: next_nodes tells us exactly which node
+    # is queued, so everything before it has completed.
+    if next_nodes:
+        next_node = next_nodes[0]
+        try:
+            idx = node_order.index(next_node)
+            if idx > 0:
+                return node_order[idx - 1], idx, node_order
+            return None, 0, node_order
+        except ValueError:
+            pass  # Unknown node — fall through to state inspection
+
+    # Fallback for completed runs (next_nodes is empty).
+    last_completed = None
+    completed_count = 0
+    for node_name in node_order:
+        field = NODE_STATE_FIELDS.get(node_name)
+        if field and state.get(field) is not None:
+            last_completed = node_name
+            completed_count += 1
+        else:
+            break
+    return last_completed, completed_count, node_order
 
 
 @router.post("/template")
@@ -54,7 +153,7 @@ async def handle_template(request: Request):
     )
 
     if request_type == "connect":
-        return await _handle_connect(pubsub, template_graph, thread_id, run_id)
+        return await handle_checkpointer_connect(pubsub, template_graph, thread_id, run_id, RECONNECT_CONFIG)
 
     return await _handle_chat(
         pubsub,
@@ -96,7 +195,7 @@ async def _handle_chat(
     """Handle Chat — start new run via LangGraphAgent + EventAdapter."""
 
     if not query.strip():
-        return await _handle_connect(pubsub, template_graph, thread_id, run_id)
+        return await handle_checkpointer_connect(pubsub, template_graph, thread_id, run_id, RECONNECT_CONFIG)
 
     # Duplicate query detection via checkpointer
     try:
@@ -160,7 +259,10 @@ async def _handle_chat(
 
     adapter = EventAdapter()
     event_stream = adapter.stream_events(
-        template_agent, input_data, state_snapshot_key="template"
+        template_agent, input_data,
+        state_snapshot_key="template",
+        allowed_step_names=set(NODE_META.keys()),
+        reasoning_step_names={"analyze_template"},
     )
 
     from stream_reconnection_demo.core.agent_runner import (
@@ -168,190 +270,163 @@ async def _handle_chat(
     )
 
     async def live_stream():
-        # Subscribe to Pub/Sub BEFORE starting the background task
-        # so no events are missed (especially RUN_STARTED).
-        channel_key = pubsub._channel_key(thread_id, run_id)
-        ps = pubsub._redis.pubsub()
-        await ps.subscribe(channel_key)
-
-        try:
+        # Subscribe BEFORE starting the background task so no events are missed.
+        async with pubsub.open_subscription(thread_id, run_id) as events:
             # Now start the background task — events buffer in subscription
             start_agent_task_pubsub_only(
                 pubsub, template_graph, thread_id, run_id, event_stream
             )
 
-            while True:
-                msg = await ps.get_message(
-                    ignore_subscribe_messages=True, timeout=5.0
-                )
-                if msg is None:
-                    status = await pubsub.get_run_status(thread_id, run_id)
-                    if status in ("completed", "error", None):
-                        return
-                    continue
-
-                if msg["type"] != "message":
-                    continue
-
-                raw = msg["data"]
-                if raw in (STREAM_END, STREAM_ERROR):
-                    return
-
-                try:
-                    envelope = json.loads(raw)
-                    yield envelope["event"]
-                except (json.JSONDecodeError, TypeError):
-                    continue
-        except Exception:
-            logger.exception("Template live stream failed for run %s", run_id)
-            yield emitter.emit_run_error("Stream failed")
-        finally:
-            await ps.unsubscribe(channel_key)
-            await ps.aclose()
+            async for event in events:
+                yield event
 
     return StreamingResponse(live_stream(), media_type=emitter.content_type)
 
 
-async def _handle_connect(pubsub, template_graph, thread_id: str, run_id: str):
-    """Handle Connect — catch-up from checkpointer, then bridge to live Pub/Sub."""
+def _emit_analysis_reasoning(state: dict):
+    """Emit analysis results as a single reasoning panel for catch-up.
 
-    active_run_id = None
-    try:
-        active_run_id = await pubsub.get_active_run(thread_id)
-    except Exception:
-        logger.warning("Failed to check active run for thread %s", thread_id)
+    Formats each AnalysisResult as readable paragraphs (aspect, severity,
+    findings, suggestions) instead of raw JSON.
+    """
+    analyses = state.get("analyses", [])
+    overall = state.get("overall_assessment")
+    if not analyses and not overall:
+        return
 
-    if active_run_id:
-        logger.info(
-            "Template connect: active run %s, catching up from checkpointer",
-            active_run_id,
+    mid = str(uuid.uuid4())
+    yield emitter.emit_reasoning_start(mid)
+    yield emitter.emit_reasoning_message_start(mid)
+
+    for i, analysis in enumerate(analyses):
+        aspect = analysis.get("aspect", "Unknown").replace("_", " ").title()
+        severity = analysis.get("severity", "")
+        findings = analysis.get("findings", "")
+        suggestions = analysis.get("suggestions", [])
+
+        content = f"**{aspect}** (severity: {severity})\n\n{findings}"
+        if suggestions:
+            content += "\n\nSuggestions:\n" + "\n".join(
+                f"- {s}" for s in suggestions
+            )
+        if i < len(analyses) - 1:
+            content += "\n\n---\n\n"
+        yield emitter.emit_reasoning_content(mid, content)
+
+    if overall:
+        needs_improvement = state.get("needs_improvement", False)
+        yield emitter.emit_reasoning_content(
+            mid,
+            f"\n\n---\n\n**Overall Assessment**\n\n{overall}\n\n"
+            f"Needs improvement: {'Yes' if needs_improvement else 'No'}",
         )
 
-        async def reconnect_stream():
-            channel_key = pubsub._channel_key(thread_id, active_run_id)
-            ps = pubsub._redis.pubsub()
-            await ps.subscribe(channel_key)
-
-            try:
-                # Read checkpointer state for catch-up
-                try:
-                    checkpoint_state = await template_graph.aget_state(
-                        {"configurable": {"thread_id": thread_id}}
-                    )
-                except Exception:
-                    checkpoint_state = None
-
-                # Emit synthetic catch-up events
-                async for event in _emit_synthetic_catchup(
-                    checkpoint_state.values if checkpoint_state and checkpoint_state.values else {},
-                    thread_id,
-                    run_id,
-                ):
-                    yield event
-
-                # Yield live events from Pub/Sub
-                while True:
-                    message = await ps.get_message(
-                        ignore_subscribe_messages=True, timeout=5.0
-                    )
-                    if message is None:
-                        status = await pubsub.get_run_status(
-                            thread_id, active_run_id
-                        )
-                        if status in ("completed", "error"):
-                            try:
-                                final_state = await template_graph.aget_state(
-                                    {"configurable": {"thread_id": thread_id}}
-                                )
-                                if final_state and final_state.values:
-                                    template = final_state.values.get("template")
-                                    if template:
-                                        yield emitter.emit_state_snapshot(template)
-                            except Exception:
-                                pass
-                            yield emitter.emit_run_finished(thread_id, run_id)
-                            return
-                        continue
-
-                    if message["type"] != "message":
-                        continue
-
-                    try:
-                        parsed = json.loads(message["data"])
-                        event_data = parsed.get("event", "")
-                    except (ValueError, TypeError):
-                        continue
-
-                    if event_data in (STREAM_END, STREAM_ERROR):
-                        try:
-                            final_state = await template_graph.aget_state(
-                                {"configurable": {"thread_id": thread_id}}
-                            )
-                            if final_state and final_state.values:
-                                template = final_state.values.get("template")
-                                if template:
-                                    yield emitter.emit_state_snapshot(template)
-                        except Exception:
-                            pass
-                        yield emitter.emit_run_finished(thread_id, run_id)
-                        return
-
-                    yield event_data
-            finally:
-                await ps.unsubscribe(channel_key)
-                await ps.aclose()
-
-        return StreamingResponse(
-            reconnect_stream(), media_type=emitter.content_type
-        )
-
-    # No active run — check checkpointer for completed state
-    try:
-        checkpoint_state = await template_graph.aget_state(
-            {"configurable": {"thread_id": thread_id}}
-        )
-    except Exception:
-        checkpoint_state = None
-
-    if checkpoint_state and checkpoint_state.values:
-        logger.info(
-            "Template connect: completed state from checkpointer for thread %s",
-            thread_id,
-        )
-
-        async def completed_stream():
-            async for event in _emit_synthetic_catchup(
-                checkpoint_state.values, thread_id, run_id
-            ):
-                yield event
-            yield emitter.emit_run_finished(thread_id, run_id)
-
-        return StreamingResponse(
-            completed_stream(), media_type=emitter.content_type
-        )
-
-    # Nothing found
-    logger.info("Template connect: no state for thread %s", thread_id)
-
-    async def empty_stream():
-        yield emitter.emit_run_started(thread_id, run_id)
-        yield emitter.emit_run_finished(thread_id, run_id)
-
-    return StreamingResponse(empty_stream(), media_type=emitter.content_type)
+    yield emitter.emit_reasoning_message_end(mid)
+    yield emitter.emit_reasoning_end(mid)
 
 
-async def _emit_synthetic_catchup(state: dict, thread_id: str, run_id: str):
-    """Emit synthetic AG-UI events from checkpointer state for catch-up."""
+def _emit_quality_text(state: dict):
+    """Emit individual quality reports and summary as text messages for catch-up."""
+    for field in ("spelling_report", "tone_report", "cta_report", "quality_summary"):
+        content = state.get(field)
+        if content:
+            mid = str(uuid.uuid4())
+            yield emitter.emit_text_start(mid, "assistant")
+            yield emitter.emit_text_content(mid, content)
+            yield emitter.emit_text_end(mid)
+
+
+async def _emit_synthetic_catchup(state: dict, thread_id: str, run_id: str, next_nodes: tuple = ()):
+    """Emit synthetic AG-UI events from checkpointer state for catch-up.
+
+    Reconstructs per-node progress and state snapshots so the frontend
+    can show where the pipeline is.
+    """
+    message_id = str(uuid.uuid4())
     yield emitter.emit_run_started(thread_id, run_id)
 
-    # Restore chat history
+    # Restore chat history from checkpointer messages
     messages = state.get("messages", [])
     if messages:
         agui_msgs = emitter.langchain_messages_to_agui(messages)
         if agui_msgs:
             yield emitter.emit_messages_snapshot(agui_msgs)
 
-    # Emit template state snapshot
+    # Emit synthetic progress for each completed node
+    _, completed_count, node_order = _reconstruct_progress_from_state(state, next_nodes)
+    for i in range(completed_count):
+        node_name = node_order[i]
+        meta = NODE_META[node_name]
+
+        yield emitter.emit_step_start(node_name)
+
+        tool_call_id = str(uuid.uuid4())
+        yield emitter.emit_tool_call_start(tool_call_id, "update_progress_status", message_id)
+        yield emitter.emit_tool_call_args(
+            tool_call_id,
+            json.dumps({
+                "status": meta["status"],
+                "node": node_name,
+                "node_index": meta["index"],
+                "total_nodes": TOTAL_NODES,
+            }),
+        )
+        yield emitter.emit_tool_call_end(tool_call_id)
+
+        yield emitter.emit_activity_snapshot(
+            str(uuid.uuid4()), "processing",
+            {"title": meta["title"], "progress": meta["progress"], "details": meta["details"]},
+        )
+
+        # Restore analysis content as text messages after relevant nodes
+        if node_name == "analyze_template":
+            for event in _emit_analysis_reasoning(state):
+                yield event
+        elif node_name == "quality_check":
+            for event in _emit_quality_text(state):
+                yield event
+
+        yield emitter.emit_step_finish(node_name)
+
+    # If pipeline is still running, show indicator for the next node
+    if 0 < completed_count < TOTAL_NODES:
+        next_node = node_order[completed_count]
+        next_meta = NODE_META[next_node]
+        yield emitter.emit_activity_snapshot(
+            str(uuid.uuid4()), "processing",
+            {"title": next_meta["title"], "progress": next_meta["progress"], "details": "Processing..."},
+        )
+
+    # Emit state snapshots for template and quality summary
     template = state.get("template")
     if template:
         yield emitter.emit_state_snapshot(template)
+
+    # Restore completed progress status
+    if completed_count == TOTAL_NODES:
+        completion_tool_id = str(uuid.uuid4())
+        yield emitter.emit_tool_call_start(completion_tool_id, "update_progress_status", message_id)
+        yield emitter.emit_tool_call_args(
+            completion_tool_id,
+            json.dumps({
+                "status": "completed",
+                "node": node_order[-1],
+                "node_index": TOTAL_NODES - 1,
+                "total_nodes": TOTAL_NODES,
+            }),
+        )
+        yield emitter.emit_tool_call_end(completion_tool_id)
+
+
+def _get_completed_count(state: dict, next_nodes: tuple = ()) -> int:
+    """Return just the completed_count for ReconnectConfig."""
+    _, completed_count, _ = _reconstruct_progress_from_state(state, next_nodes)
+    return completed_count
+
+
+RECONNECT_CONFIG = ReconnectConfig(
+    node_meta=NODE_META,
+    state_snapshot_key="template",
+    emit_catchup=_emit_synthetic_catchup,
+    get_completed_count=_get_completed_count,
+)
