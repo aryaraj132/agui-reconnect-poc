@@ -1,6 +1,6 @@
 # AG-UI Stream Reconnection Demo
 
-A proof-of-concept demonstrating **SSE stream reconnection** for AI agent pipelines using the [AG-UI protocol](https://github.com/ag-ui-protocol/ag-ui), [CopilotKit](https://copilotkit.ai), Redis Pub/Sub, and LangGraph.
+A proof-of-concept demonstrating **SSE stream reconnection** for AI agent pipelines using the [AG-UI protocol](https://github.com/ag-ui-protocol/ag-ui), [CopilotKit](https://copilotkit.ai), Redis Pub/Sub, LangGraph, and the [`ag-ui-langgraph`](https://pypi.org/project/ag-ui-langgraph/) library.
 
 ## Problem
 
@@ -8,9 +8,9 @@ In AG-UI applications, when a user reloads the browser during an active agent st
 
 ## Solution
 
-This demo implements two reconnection strategies side-by-side:
+This demo implements **two agents** (Segment Builder and Template Builder) with **three reconnection strategies**:
 
-### Strategy 1: Redis Pub/Sub + List (`/api/v1/segment`)
+### Segment Agent — Strategy 1: Redis Pub/Sub + List (`/api/v1/segment`)
 
 Full event replay with zero event loss:
 
@@ -18,7 +18,7 @@ Full event replay with zero event loss:
 2. **Race-condition-safe catch-up**: subscribe to Pub/Sub first, read List second, deduplicate by sequence number
 3. On reconnect, the client sees a fast-forward replay of all missed events
 
-### Strategy 2: Checkpointer-Only (`/api/v1/stateful-segment`)
+### Segment Agent — Strategy 2: Checkpointer-Only (`/api/v1/stateful-segment`)
 
 Lightweight state-snapshot catch-up without event persistence:
 
@@ -26,11 +26,20 @@ Lightweight state-snapshot catch-up without event persistence:
 2. **Catch-up from LangGraph MemorySaver** checkpointer state reconstructed as synthetic AG-UI events
 3. On reconnect, the client jumps to the current state (no replay animation)
 
-Both strategies share the same 8-node LangGraph pipeline and CopilotKit frontend. The difference is only in how reconnection catch-up is handled.
+Both segment strategies share the same 8-node LangGraph pipeline and CopilotKit frontend. The difference is only in how reconnection catch-up is handled.
+
+### Template Agent — `ag-ui-langgraph` + Checkpointer (`/api/v1/template`)
+
+Uses the `ag-ui-langgraph` library for **automatic AG-UI event generation** instead of manual event emission:
+
+1. **`LangGraphAgent.run()`** wraps `graph.astream_events()` and auto-translates LangGraph internals into AG-UI events (RUN_*, STEP_*, STATE_SNAPSHOT, TEXT_MESSAGE_*, REASONING_*)
+2. **`EventAdapter`** bridges the library's event objects into SSE strings, translating custom events and filtering intermediate snapshots
+3. **Checkpointer as single source of truth** — no Redis List. Catch-up on reconnect reads from checkpointer state
+4. **Redis Pub/Sub** for live event delivery only (ephemeral)
 
 ## Architecture
 
-### Strategy 1: Full Event Replay (Pub/Sub + List)
+### Segment: Strategy 1 — Full Event Replay (Pub/Sub + List)
 
 ```
                     New Run (Chat)
@@ -51,7 +60,7 @@ Both strategies share the same 8-node LangGraph pipeline and CopilotKit frontend
     <──── SSE ────────────┘
 ```
 
-### Strategy 2: Checkpointer-Only Catch-Up
+### Segment: Strategy 2 — Checkpointer-Only Catch-Up
 
 ```
                     New Run (Chat)
@@ -70,6 +79,28 @@ Both strategies share the same 8-node LangGraph pipeline and CopilotKit frontend
     |                 3. Yield synthetic catch-up events (from state)
     |                 4. Yield live events (from Pub/Sub)
     <──── SSE ─────────────┘
+```
+
+### Template: ag-ui-langgraph + Checkpointer
+
+```
+                    New Run (Chat)
+  CopilotKit ─POST─> /api/v1/template ──> Start Background Task
+    ^                     |                       |
+    |                     |                LangGraphAgent.run()
+    |                     |                  → EventAdapter
+    |                     |                       |
+    |                     v                       v
+    <──── SSE ──── Pub/Sub Subscribe <── Pub/Sub Publish (only)
+
+                    Reconnection (Connect)
+  CopilotKit ─POST─> /api/v1/template
+    ^                     |
+    |                1. Subscribe Pub/Sub (buffer live events)
+    |                2. Read checkpointer state (MemorySaver)
+    |                3. Yield synthetic catch-up events (from state)
+    |                4. Yield live events (from Pub/Sub)
+    <──── SSE ────────────┘
 ```
 
 ### CopilotKit Integration Flow
@@ -92,7 +123,7 @@ Both strategies share the same 8-node LangGraph pipeline and CopilotKit frontend
     |<── Restore UI state ──────── |                              |
 ```
 
-### Duplicate-Query Prevention
+### Duplicate-Query Prevention (Both Agents)
 
 CopilotKit re-sends the full messages array after each run completes. Without protection this creates an infinite re-run loop:
 
@@ -103,18 +134,20 @@ CopilotKit re-sends the full messages array after each run completes. Without pr
        |                                      |   with checkpointer state
        |                                      |
        |    (same query already processed)    |
-       |<── RUN_STARTED + STATE_SNAPSHOT ─────|  <── replay segment state
+       |<── RUN_STARTED + STATE_SNAPSHOT ─────|  <── replay state
        |<── RUN_FINISHED ─────────────────────|  <── CopilotKit satisfied
        |                                      |
        |    (new query)                       |
-       |<── Full pipeline run ────────────────|
+       |<── Full pipeline/agent run ──────────|
 ```
 
-The `STATE_SNAPSHOT` in the duplicate response is critical: `RUN_STARTED` resets CopilotKit's co-agent state, so without replaying the segment data, the segment card would vanish.
+The `STATE_SNAPSHOT` in the duplicate response is critical: `RUN_STARTED` resets CopilotKit's co-agent state, so without replaying the state data, the segment card or template would vanish.
 
-## AG-UI Events Emitted Per Node
+## AG-UI Events
 
-Each of the 8 pipeline nodes emits this sequence of AG-UI events:
+### Segment Agent — Events Per Node
+
+Each of the 8 pipeline nodes emits this sequence of manually-constructed AG-UI events:
 
 ```
 STEP_STARTED
@@ -149,7 +182,28 @@ TEXT_MESSAGE_END
 RUN_FINISHED
 ```
 
-## Pipeline Nodes
+### Template Agent — Events (Auto-Generated)
+
+The `ag-ui-langgraph` library auto-generates events from `LangGraphAgent.run()`:
+
+```
+RUN_STARTED
+STATE_SNAPSHOT {}                  <── injected by EventAdapter to clear old state
+STEP_STARTED
+  ACTIVITY_SNAPSHOT               <── translated from custom event by EventAdapter
+  TEXT_MESSAGE_START              <── auto from LLM streaming
+  TEXT_MESSAGE_CONTENT (×N)       <── auto from LLM streaming
+  TEXT_MESSAGE_END                <── auto from LLM streaming
+STEP_FINISHED
+STATE_SNAPSHOT {html, css, subject, preview_text, sections, version}
+RUN_FINISHED
+```
+
+Custom events dispatched from graph nodes via `adispatch_custom_event("activity_snapshot", ...)` are intercepted by the `EventAdapter` and translated to proper `ActivitySnapshotEvent` objects.
+
+## Graph Nodes
+
+### Segment Agent — 8-Node Pipeline
 
 | # | Node | Progress | Purpose |
 |---|------|----------|---------|
@@ -163,6 +217,15 @@ RUN_FINISHED
 | 7 | `build_segment` | 95% | Final segment generation with Claude (structured output) |
 
 Each node runs for ~8-10 seconds (simulated processing), except `build_segment` which makes an actual LLM call to Claude Sonnet.
+
+### Template Agent — 2-Node Graph with Conditional Routing
+
+| Node | When | Purpose |
+|------|------|---------|
+| `generate_template` | No existing template | Create a new email template from user description |
+| `modify_template` | Template exists | Modify existing template based on user request |
+
+Routing is determined by `_route_by_state()`: if `state["template"] is None`, route to `generate_template`, otherwise `modify_template`. Both nodes use `ChatAnthropic.with_structured_output(EmailTemplate)` for structured LLM output.
 
 ## Prerequisites
 
@@ -191,15 +254,30 @@ just frontend         # React+Webpack on http://localhost:3000
 just frontend-next    # Next.js on http://localhost:3000
 ```
 
-Open http://localhost:3000 and describe your target audience to generate a segment.
+Open http://localhost:3000 to see the home page with links to both agents.
+
+### Testing Segment Agent
+
+1. Navigate to `/segment`
+2. Type a query (e.g., "Users from the US who signed up in the last 30 days and made a purchase")
+3. Watch the 8-step progress stepper, reasoning panels, and activity indicators
+4. Final segment card renders when pipeline completes
+
+### Testing Template Agent
+
+1. Navigate to `/template`
+2. Type a description (e.g., "A welcome email for new SaaS users with a hero image and CTA button")
+3. Watch the activity indicator during LLM generation
+4. Template renders in the editor with subject, preview text, and HTML preview
+5. Type a modification (e.g., "Change the CTA button to blue") — template updates with version increment
 
 ### Testing Reconnection
 
-1. Start a segment generation (e.g., "Users from the US who signed up in the last 30 days and made a purchase")
-2. While the 8-node pipeline is running (~80s), **reload the page**
+1. Start a segment or template generation
+2. While the agent is running, **reload the page**
 3. CopilotKit automatically reconnects via the Connect flow
-4. Events replay from Redis List (catch-up), then live follow via Pub/Sub
-5. Pipeline completes normally with UI restored
+4. For segment: events replay from Redis List (catch-up), then live follow via Pub/Sub
+5. For template: catch-up from checkpointer state, then live Pub/Sub bridging
 
 ### Testing Mid-Execution Join
 
@@ -207,9 +285,8 @@ Open http://localhost:3000 and describe your target audience to generate a segme
 2. Copy the URL (with `?thread=...` param) to another browser/tab
 3. Open it — events catch up from Redis and bridge to live
 
-### Testing Stateful Variant
+### Testing Stateful Segment Variant
 
-- **React frontend**: Navigate to `/stateful-segment` (any path containing "stateful")
 - **Next.js frontend**: Navigate to `/stateful-segment`
 
 Same pipeline, but reconnection uses checkpointer state snapshots instead of event replay.
@@ -222,6 +299,7 @@ agui_stream_reconnection_demo/
 │   ├── main.py                          # FastAPI app, lifespan, CORS, routers
 │   ├── core/
 │   │   ├── events.py                    # AG-UI EventEmitter (SSE encoding)
+│   │   ├── event_adapter.py             # Bridges LangGraphAgent → SSE strings
 │   │   ├── pubsub.py                    # Redis Pub/Sub + List manager
 │   │   ├── agent_runner.py              # Background asyncio task runner
 │   │   └── middleware.py                # AG-UI event logging middleware
@@ -230,12 +308,17 @@ agui_stream_reconnection_demo/
 │   │   │   ├── graph.py                 # 8-node LangGraph pipeline (Claude Sonnet)
 │   │   │   ├── routes.py                # POST /api/v1/segment
 │   │   │   └── state.py                 # SegmentAgentState TypedDict
-│   │   └── stateful_segment/
-│   │       └── routes.py                # POST /api/v1/stateful-segment
+│   │   ├── stateful_segment/
+│   │   │   └── routes.py                # POST /api/v1/stateful-segment
+│   │   └── template/
+│   │       ├── graph.py                 # 2-node LangGraph (generate/modify)
+│   │       ├── routes.py                # POST /api/v1/template
+│   │       └── state.py                 # TemplateAgentState + TemplateOutput
 │   └── schemas/
-│       └── segment.py                   # Segment, Condition, ConditionGroup (Pydantic)
+│       ├── segment.py                   # Segment, Condition, ConditionGroup (Pydantic)
+│       └── template.py                  # EmailTemplate, TemplateSection (Pydantic)
 │
-├── frontend/                            # React + Webpack (primary)
+├── frontend/                            # React + Webpack (segment only)
 │   ├── src/
 │   │   ├── App.tsx                      # CopilotKit + CopilotSidebar + main layout
 │   │   ├── components/
@@ -251,18 +334,27 @@ agui_stream_reconnection_demo/
 │   ├── webpack.config.js                # Webpack + embedded CopilotRuntime
 │   └── package.json
 │
-├── frontend-next/                       # Next.js (reference)
+├── frontend-next/                       # Next.js (both agents)
 │   ├── app/
-│   │   ├── page.tsx                     # Redirects to /segment
+│   │   ├── page.tsx                     # Home page — card grid with agent links
 │   │   ├── layout.tsx                   # Root layout + CopilotKit styles
 │   │   ├── segment/page.tsx             # Segment builder page
 │   │   ├── stateful-segment/page.tsx    # Stateful variant page
+│   │   ├── template/page.tsx            # Template builder page
 │   │   └── api/copilotkit/
 │   │       ├── segment/route.ts         # CopilotRuntime proxy → /api/v1/segment
-│   │       └── stateful-segment/route.ts # CopilotRuntime proxy → /api/v1/stateful-segment
-│   ├── components/                      # Shared components (same as frontend/)
+│   │       ├── stateful-segment/route.ts # CopilotRuntime proxy → /api/v1/stateful-segment
+│   │       └── template/route.ts        # CopilotRuntime proxy → /api/v1/template
+│   ├── components/
+│   │   ├── SegmentCard.tsx              # Segment card (conditions, scope)
+│   │   ├── ProgressStatus.tsx           # 8-step pipeline stepper
+│   │   ├── ActivityIndicator.tsx        # Processing progress bar
+│   │   ├── ReasoningPanel.tsx           # Collapsible chain-of-thought panel
+│   │   ├── TemplateEditor.tsx           # Template metadata bar + preview wrapper
+│   │   ├── TemplatePreview.tsx          # Sandboxed iframe HTML preview
+│   │   └── Nav.tsx                      # Navigation header with active tab
 │   ├── hooks/useAgentThread.ts
-│   ├── lib/types.ts
+│   ├── lib/types.ts                     # Segment + EmailTemplate TypeScript types
 │   └── next.config.ts
 │
 ├── justfile                             # Task runner commands
@@ -274,14 +366,14 @@ agui_stream_reconnection_demo/
 
 ### Single Endpoint, Intent Detection
 
-Both endpoints use CopilotKit's `requestType` metadata to determine behavior:
+All three endpoints use CopilotKit's `requestType` metadata to determine behavior:
 
 | Scenario | requestType | Backend Action |
 |----------|-------------|----------------|
 | User sends new query | `chat` | Start background agent task, stream via Pub/Sub |
 | CopilotKit re-sends same query | `chat` | Duplicate detected via checkpointer, return state snapshot |
 | Browser reload / new tab | `connect` | Catch-up from List/checkpointer + bridge to live Pub/Sub |
-| Completed run reload | `connect` | Replay segment state from checkpointer |
+| Completed run reload | `connect` | Replay state from checkpointer |
 
 ### Race-Condition-Safe Catch-Up (Strategy 1)
 
@@ -314,10 +406,17 @@ Each event gets a monotonic `seq` from `RPUSH` return value, enabling reliable d
 
 The frontend uses CopilotKit hooks to interact with the backend:
 
-- **`useCoAgent<Segment>({ name: "default" })`** — Reads co-agent state from `STATE_SNAPSHOT` events. Renders the segment card in the main content area (not inline in chat).
-- **`useCopilotAction("update_progress_status")`** — Receives progress tool calls from the backend to update the pipeline stepper UI. Handles `status: "starting"` to clear stale progress between runs.
-- **`CopilotSidebar` with `RenderMessage`** — Custom message renderer that handles `reasoning` and `activity` message roles for chain-of-thought and progress display.
-- **`useAgentThread()`** — Manages thread IDs via URL query params (`?thread=...`) with browser history support. Enables mid-execution joins by sharing URLs.
+**Segment Agent:**
+- **`useCoAgent<Segment>({ name: "default" })`** — Reads co-agent state from `STATE_SNAPSHOT` events. Renders the segment card in the main content area.
+- **`useCopilotAction("update_progress_status")`** — Receives progress tool calls from the backend to update the pipeline stepper UI.
+- **`CopilotSidebar` with `RenderMessage`** — Custom message renderer for `reasoning` and `activity` message roles.
+- **`useAgentThread()`** — Manages thread IDs via URL query params (`?thread=...`) with browser history support.
+
+**Template Agent:**
+- **`useCoAgent<EmailTemplate>({ name: "default" })`** — Reads template state from `STATE_SNAPSHOT` events. Renders the TemplateEditor with live HTML preview.
+- **`useCoAgentStateRender`** — Inline notification in chat when template is updated.
+- **`CopilotSidebar` with `RenderMessage`** — Same custom renderer pattern as segment (filters old reasoning/activity messages).
+- **`useAgentThread()`** — Same thread management hook, shared across both agents.
 
 ### CopilotKit Runtime Configuration
 
@@ -328,6 +427,7 @@ The frontend uses CopilotKit hooks to interact with the backend:
 **Next.js (`frontend-next/`):** CopilotRuntime is configured as API route handlers using `LangGraphHttpAgent`:
 - `/api/copilotkit/segment` → `http://localhost:8000/api/v1/segment`
 - `/api/copilotkit/stateful-segment` → `http://localhost:8000/api/v1/stateful-segment`
+- `/api/copilotkit/template` → `http://localhost:8000/api/v1/template`
 
 ## API Endpoints
 
@@ -335,6 +435,8 @@ The frontend uses CopilotKit hooks to interact with the backend:
 |--------|----------|---------|
 | POST | `/api/v1/segment` | Segment pipeline with Pub/Sub + List catch-up |
 | POST | `/api/v1/stateful-segment` | Segment pipeline with checkpointer-only catch-up |
+| POST | `/api/v1/template` | Template agent with ag-ui-langgraph + checkpointer catch-up |
+| GET | `/api/v1/template/state/{thread_id}` | Direct checkpointer read for template state |
 | GET | `/health` | Health check |
 
 ### Request Body (AG-UI Protocol)
@@ -370,16 +472,16 @@ data: {"type":"TOOL_CALL_START","toolCallId":"...","toolCallName":"update_progre
 
 ## Strategy Comparison
 
-| Feature | Strategy 1 (Pub/Sub + List) | Strategy 2 (Checkpointer-Only) |
-|---------|---------------------------|-------------------------------|
-| Live streaming | Redis Pub/Sub | Redis Pub/Sub |
-| Event persistence | Redis List (RPUSH) | None |
-| Catch-up source | Redis List (LRANGE) | LangGraph MemorySaver |
-| Catch-up fidelity | Full event replay (fast-forward) | State snapshot (jump to current) |
-| Missed events | Zero (List has all events) | Possible during Pub/Sub gaps |
-| Redis usage | Pub/Sub + List + tracking keys | Pub/Sub + tracking keys only |
-| Complexity | Higher (dedup by seq) | Lower (synthetic events) |
-| Best for | Perfect replay required | State-only catch-up sufficient |
+| Feature | Segment: Pub/Sub + List | Segment: Checkpointer-Only | Template: ag-ui-langgraph |
+|---------|------------------------|---------------------------|--------------------------|
+| Live streaming | Redis Pub/Sub | Redis Pub/Sub | Redis Pub/Sub |
+| Event generation | Manual (`EventEmitter`) | Manual (`EventEmitter`) | Auto (`LangGraphAgent` + `EventAdapter`) |
+| Event persistence | Redis List (RPUSH) | None | None |
+| Catch-up source | Redis List (LRANGE) | LangGraph MemorySaver | LangGraph MemorySaver |
+| Catch-up fidelity | Full event replay | State snapshot | State snapshot |
+| Redis usage | Pub/Sub + List + tracking | Pub/Sub + tracking only | Pub/Sub + tracking only |
+| Complexity | Higher (dedup by seq) | Lower (synthetic events) | Lowest (library handles events) |
+| Best for | Perfect replay required | State-only catch-up | Library-driven agent integration |
 
 ## Environment Variables
 
@@ -396,6 +498,7 @@ data: {"type":"TOOL_CALL_START","toolCallId":"...","toolCallName":"update_progre
 |-------|-----------|
 | LLM | Claude Sonnet via `langchain-anthropic` |
 | Agent framework | LangGraph with MemorySaver checkpointer |
+| AG-UI automation | `ag-ui-langgraph` (template agent) |
 | Backend | FastAPI + Uvicorn |
 | Streaming protocol | AG-UI (SSE-based) |
 | Event persistence | Redis Pub/Sub + Lists |

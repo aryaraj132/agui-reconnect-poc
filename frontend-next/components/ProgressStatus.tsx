@@ -5,9 +5,12 @@ interface ProgressStatusProps {
   node: string;
   nodeIndex: number;
   totalNodes: number;
+  nodeLabels?: Record<string, string>;
+  nodeOrder?: string[];
+  completedLabel?: string;
 }
 
-const NODE_LABELS: Record<string, string> = {
+const SEGMENT_NODE_LABELS: Record<string, string> = {
   analyze_requirements: "Analyze",
   extract_entities: "Entities",
   validate_fields: "Validate",
@@ -18,7 +21,7 @@ const NODE_LABELS: Record<string, string> = {
   build_segment: "Build",
 };
 
-const NODE_ORDER = [
+const SEGMENT_NODE_ORDER = [
   "analyze_requirements",
   "extract_entities",
   "validate_fields",
@@ -34,6 +37,9 @@ export function ProgressStatus({
   node,
   nodeIndex,
   totalNodes,
+  nodeLabels = SEGMENT_NODE_LABELS,
+  nodeOrder = SEGMENT_NODE_ORDER,
+  completedLabel = "Segment Complete",
 }: ProgressStatusProps) {
   const isCompleted = status === "completed";
 
@@ -42,8 +48,8 @@ export function ProgressStatus({
       <div className="flex items-center justify-between mb-2">
         <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
           {isCompleted
-            ? "Segment Complete"
-            : `${NODE_LABELS[node] || node}...`}
+            ? completedLabel
+            : `${nodeLabels[node] || node}...`}
         </span>
         <span className="text-xs text-gray-500">
           {isCompleted
@@ -54,7 +60,7 @@ export function ProgressStatus({
 
       {/* Stepper */}
       <div className="flex items-center gap-1">
-        {NODE_ORDER.slice(0, totalNodes).map((nodeName, i) => {
+        {nodeOrder.slice(0, totalNodes).map((nodeName, i) => {
           let stepState: "completed" | "active" | "pending";
           if (isCompleted || i < nodeIndex) {
             stepState = "completed";
@@ -132,7 +138,7 @@ export function ProgressStatus({
                     : "text-gray-400"
                 }`}
               >
-                {NODE_LABELS[nodeName] || nodeName}
+                {nodeLabels[nodeName] || nodeName}
               </span>
             </div>
           );
